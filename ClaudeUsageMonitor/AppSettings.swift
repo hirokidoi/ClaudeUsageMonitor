@@ -11,7 +11,7 @@ extension Bundle {
 }
 
 class AppSettings: ObservableObject {
-  static let defaultUrl = "https://claude.ai/settings/usage"
+  static let defaultUrl = "https://claude.ai/new#settings/usage"
 
   private enum Keys {
     static let url = "url"

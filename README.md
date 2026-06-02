@@ -154,7 +154,7 @@ Orange へ遷移した瞬間に macOS のユーザー通知（`Claude Usage Warn
 
 | 項目 | 説明 |
 |------|------|
-| URL | 監視対象 URL（デフォルト `https://claude.ai/settings/usage`） |
+| URL | 監視対象 URL |
 | 実行間隔 | 秒単位（10〜86400 秒、10 秒刻み、初期値 300 秒） |
 | APIエンドポイントURL | JSON を POST する先の URL（空にすると POST 無効） |
 | モニタリング用JSONファイル名 | `$TMPDIR` に保存するファイル名（空にすると保存無効） |

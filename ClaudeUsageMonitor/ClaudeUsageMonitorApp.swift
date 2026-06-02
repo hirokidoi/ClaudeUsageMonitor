@@ -202,35 +202,52 @@ struct LogView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
-        // 全 entry を 1 つの Text にまとめて複数行選択を可能にする
-        // 末尾マーカー (Color.clear) を置き scrollTo で自動末尾追従
-        ScrollViewReader { proxy in
-          ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-              Text(combinedLogText)
-                .font(.system(size: 11, design: .monospaced))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-              Color.clear.frame(height: 1).id("log-bottom")
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-          }
-          .onChange(of: logStore.entries.count) { _, _ in
-            withAnimation(.none) {
-              proxy.scrollTo("log-bottom", anchor: .bottom)
-            }
-          }
-          .onAppear {
-            proxy.scrollTo("log-bottom", anchor: .bottom)
-          }
-        }
+        LogTextView(entries: logStore.entries)
       }
     }
     .frame(minWidth: 500, minHeight: 300)
   }
+}
 
-  private var combinedLogText: String {
-    logStore.entries.map(\.formatted).joined(separator: "\n")
+// MARK: - LogTextView
+
+private struct LogTextView: NSViewRepresentable {
+  let entries: [LogEntry]
+
+  func makeCoordinator() -> Coordinator { Coordinator() }
+
+  func makeNSView(context: Context) -> NSScrollView {
+    let scrollView = NSTextView.scrollableTextView()
+    guard let textView = scrollView.documentView as? NSTextView else { return scrollView }
+    textView.isEditable = false
+    textView.isSelectable = true
+    textView.drawsBackground = false
+    textView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+    textView.textColor = .textColor
+    textView.textContainerInset = NSSize(width: 12, height: 8)
+    textView.isVerticallyResizable = true
+    textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+    textView.textContainer?.widthTracksTextView = true
+    scrollView.hasVerticalScroller = true
+    scrollView.hasHorizontalScroller = false
+    scrollView.autohidesScrollers = true
+    scrollView.drawsBackground = false
+    return scrollView
+  }
+
+  func updateNSView(_ scrollView: NSScrollView, context: Context) {
+    guard let textView = scrollView.documentView as? NSTextView else { return }
+    // 最終行番号で変化を検知する。FIFO 満杯後も lastLineNumber は増加するため
+    // entries.count が 1000 固定でも末尾追従が正しく動く
+    let lastLine = entries.last?.lineNumber ?? 0
+    guard lastLine != context.coordinator.lastLineNumber else { return }
+    context.coordinator.lastLineNumber = lastLine
+    textView.string = entries.map(\.formatted).joined(separator: "\n")
+    let end = textView.string.utf16.count
+    textView.scrollRangeToVisible(NSRange(location: end, length: 0))
+  }
+
+  final class Coordinator {
+    var lastLineNumber: Int = -1
   }
 }
