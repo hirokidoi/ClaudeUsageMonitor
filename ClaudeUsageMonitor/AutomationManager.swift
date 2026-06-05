@@ -21,6 +21,9 @@ class AutomationManager: NSObject, ObservableObject {
   // timeout が来たら applyAPIResponseTimeout に流す
   private var pendingAPIHandler: ((Data) -> Void)?
   private var pendingAPITimeoutWorkItem: DispatchWorkItem?
+  // runManualFetch の 2 ステップナビゲーション用。about:blank ロード後にここへ遷移する
+  // WebViewCoordinator (同ファイル内) からアクセスするため fileprivate
+  fileprivate var pendingLoadURL: URL?
   private var cancellables = Set<AnyCancellable>()
   // 直前の statusBarColor。orange への遷移時のみ通知発火するために保持
   private var previousStatusBarColor: StatusBarColor = .red
@@ -225,17 +228,19 @@ class AutomationManager: NSObject, ObservableObject {
   }
 
   func runManualFetch() {
-    // 手動更新: 設定URLを改めてロード。読み込み完了 (didFinish) 後に
-    // scheduleImmediateFetch が連鎖で tick を発火する (click → API レスポンス待機)。
-    // 読み込み先が設定URLと異なる (/login 等) 場合は tick 内のガードで失敗扱いになる。
+    // 手動更新: about:blank を挟む 2 ステップナビゲーションで設定 URL をフルリロードする。
+    // fragment (#...) 付き URL を直接 load すると WKWebView が same-document navigation と
+    // 判断してフルリロードしないケースがあるため、about:blank で一旦コンテキストを破棄してから
+    // 目的 URL を再ロードする。didFinish 時に pendingLoadURL をチェックして 2 段目を発火する。
     // タイマーリセットは tick() 冒頭で行うのでここでは start() を呼ばない
     cancelAllInFlightFetches()
     guard !settings.url.isEmpty, let url = URL(string: settings.url) else {
       applyURLNotConfigured()
       return
     }
-    appLog("手動更新: URL 再ロード開始 \(url.absoluteString)")
-    webView.load(URLRequest(url: url))
+    appLog("手動更新: 強制リロード開始 \(url.absoluteString)")
+    pendingLoadURL = url
+    webView.load(URLRequest(url: URL(string: "about:blank")!))
   }
 
   // 「使用制限を更新」ボタン押下後の API レスポンスを待つスロットを破棄する。
@@ -257,6 +262,7 @@ class AutomationManager: NSObject, ObservableObject {
   private func cancelAllInFlightFetches() {
     cancelImmediateFetch()
     cancelPendingAPIWait()
+    pendingLoadURL = nil
   }
 
   func scheduleImmediateFetch() {
@@ -808,8 +814,29 @@ final class WebViewCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
 
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
     appLog("ページ読込完了: \(webView.url?.absoluteString ?? "nil")")
+    // runManualFetch の 2 ステップナビゲーション: about:blank 完了後に目的 URL をロードする
+    if webView.url?.absoluteString == "about:blank", let pendingURL = automation?.pendingLoadURL {
+      automation?.pendingLoadURL = nil
+      appLog("手動更新: 目的URL へ遷移 \(pendingURL.absoluteString)")
+      webView.load(URLRequest(url: pendingURL))
+      return
+    }
     guard settings.matches(url: webView.url) else { return }
     automation?.scheduleImmediateFetch()
+  }
+
+  func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+    if let url = automation?.pendingLoadURL {
+      appLogWarn("手動更新: about:blank 暫定ナビゲーション失敗、pendingLoadURL クリア \(url)")
+      automation?.pendingLoadURL = nil
+    }
+  }
+
+  func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+    if let url = automation?.pendingLoadURL {
+      appLogWarn("手動更新: ナビゲーション失敗、pendingLoadURL クリア \(url)")
+      automation?.pendingLoadURL = nil
+    }
   }
 
   func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
