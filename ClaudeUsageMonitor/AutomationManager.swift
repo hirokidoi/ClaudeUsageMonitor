@@ -16,11 +16,13 @@ class AutomationManager: NSObject, ObservableObject {
   private var timer: Timer?
   private var consecutiveFailureCount = 0
   private var immediateFetchWorkItem: DispatchWorkItem?
-  // tick 発火で使用量更新ボタンをクリックした後に届く API レスポンスを受け取るためのスロット。
-  // pendingAPIHandler がセット中のときだけ `/api/organizations/.../usage` の capture を採用し、
-  // timeout が来たら applyAPIResponseTimeout に流す
-  private var pendingAPIHandler: ((Data) -> Void)?
-  private var pendingAPITimeoutWorkItem: DispatchWorkItem?
+  // in-flight の usage fetch (2 段 fetch) を識別する世代番号。進めることで
+  // reload・キャンセルや多重発行時に古い completion / watchdog を無効化する
+  private var usageFetchGeneration = 0
+  private var usageFetchWatchdogWorkItem: DispatchWorkItem?
+  // organizations 解決で得た org uuid のキャッシュ。無効化するのは
+  // clearSessionAndReload / applyLoginRequired / usage fetch の 404 の 3 箇所
+  private var cachedOrgUuid: String?
   // runManualFetch の 2 ステップナビゲーション用。about:blank ロード後にここへ遷移する
   // WebViewCoordinator (同ファイル内) からアクセスするため fileprivate
   fileprivate var pendingLoadURL: URL?
@@ -45,19 +47,29 @@ class AutomationManager: NSObject, ObservableObject {
     return c
   }()
 
-  // tick で使用量更新ボタンクリック後、/api/organizations/.../usage レスポンスが
-  // 届くまで待つ上限。ネットワーク RTT + サーバ処理分を見込む
-  private static let apiResponseTimeoutSeconds: TimeInterval = 10
-
-  // claude.ai の使用量更新ボタンのセレクタ (aria-label 依存)。サイト側のラベル変更時はここを直す
-  private static let refreshButtonSelector = #"button[aria-label="更新"]"#
+  // 2 段 fetch (organizations / usage) の各 fetch に適用する JS 側タイムアウト
+  private static let fetchTimeoutSeconds: TimeInterval = 10
+  // callAsyncJavaScript の completion が呼ばれないケースに備えた Swift 側の最終上限。
+  // 2 段 fetch が各 timeout 直前まで粘る最悪ケース + マージンから導出する
+  private static let fetchWatchdogSeconds: TimeInterval = fetchTimeoutSeconds * 2 + 5
+  // usage fetch 失敗時の診断ログと JS 側の bodyHead 切り出しで共有する先頭文字数
+  private static let bodyPreviewMaxLength = 400
+  // fetch が same-origin で成立し得るページかどうかの判定に使う host
+  private static let claudeHost = "claude.ai"
 
   // Enterprise プラン UI / JSON 出力を手元アカウントで検証するための開発フラグ。
   // true の間は extra_usage.is_enabled == true のレスポンスを (five_hour/seven_day の有無に関係なく)
   // Enterprise として分類する。本番配布時は必ず false に戻すこと
   private static let enterpriseTestMode: Bool = false
-  // didFinish からページ描画が落ち着くまで待ってから tick を発火するまでの遅延
-  private static let postLoadDelaySeconds: TimeInterval = 5
+  // didFinish 連発時 (ログイン直後の複数ナビゲーション等) に tick を 1 回へ coalesce するための遅延
+  private static let postLoadDelaySeconds: TimeInterval = 1
+
+  // fetch が same-origin で成立し得るページか (host が claude.ai かサブドメイン)。
+  // tick 冒頭と WebViewCoordinator.didFinish の両方から参照する
+  static func isClaudeAiPage(_ url: URL?) -> Bool {
+    guard let host = url?.host else { return false }
+    return host == claudeHost || host.hasSuffix("." + claudeHost)
+  }
 
   private static let dateFormatter: DateFormatter = {
     let f = DateFormatter()
@@ -102,18 +114,6 @@ class AutomationManager: NSObject, ObservableObject {
     let config = WKWebViewConfiguration()
     config.limitsNavigationsToAppBoundDomains = false
 
-    // fetch / XHR をラップして /api/organizations/.../usage のレスポンスを Swift に転送する JS を
-    // atDocumentStart で注入する。userContentController は全 navigation で JS を自動再注入し、
-    // OAuth ポップアップ (createWebViewWith) にも configuration 経由で継承される
-    let userContentController = WKUserContentController()
-    let script = WKUserScript(
-      source: Self.interceptUsageJS,
-      injectionTime: .atDocumentStart,
-      forMainFrameOnly: true
-    )
-    userContentController.addUserScript(script)
-    config.userContentController = userContentController
-
     let wv = WKWebView(frame: .zero, configuration: config)
     wv.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
     self.webView = wv
@@ -124,10 +124,6 @@ class AutomationManager: NSObject, ObservableObject {
     wv.uiDelegate = coord
 
     super.init()
-
-    // super.init 後でないと self を WKScriptMessageHandler として登録できない。
-    // AutomationManager はプロセス終了まで生存するので循環参照は許容する
-    userContentController.add(self, name: "usageAPI")
 
     appLog("アプリ起動 v\(Bundle.main.appVersionLabel)")
 
@@ -181,8 +177,8 @@ class AutomationManager: NSObject, ObservableObject {
     DispatchQueue.main.async { [weak self] in self?.start() }
 
     // 起動から 5 秒後に 1 回だけ手動更新相当を走らせる。
-    // 初回ロード後の scheduleImmediateFetch は DOM 直読みのため claude.ai が
-    // キャッシュした古い値を拾うことがあり、ボタンクリック経由の更新を確実に 1 回発火させる
+    // ログイン項目起動直後はネットワークが未確立のことがあり、初回ページロードの
+    // 成功率を上げるための猶予として置く (runManualFetch 経由の一本化パスは維持する)
     appLogDebug("起動 5 秒後に runManualFetch を予約")
     DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
       self?.appLogDebug("起動 5 秒後スケジューラ発火")
@@ -246,15 +242,16 @@ class AutomationManager: NSObject, ObservableObject {
     webView.load(URLRequest(url: URL(string: "about:blank")!))
   }
 
-  // 使用量更新ボタン押下後の API レスポンスを待つスロットを破棄する。
-  // timeout と handler の両方をクリアするため tick 冒頭や reload 経路で必ず呼ぶ
-  private func cancelPendingAPIWait() {
-    pendingAPITimeoutWorkItem?.cancel()
-    pendingAPITimeoutWorkItem = nil
-    pendingAPIHandler = nil
+  // in-flight の usage fetch (2 段 fetch) を無効化する。世代を進めて古い completion /
+  // watchdog の反映を破棄しつつ、watchdog の DispatchWorkItem 自体もキャンセルする。
+  // tick 冒頭や reload 系操作で必ず呼ぶ
+  private func invalidateInFlightFetch() {
+    usageFetchGeneration += 1
+    usageFetchWatchdogWorkItem?.cancel()
+    usageFetchWatchdogWorkItem = nil
   }
 
-  // didFinish で予約した「5 秒後に tick」の即時 fetch をキャンセルする
+  // didFinish で予約した「postLoadDelaySeconds 秒後に tick」の即時 fetch をキャンセルする
   private func cancelImmediateFetch() {
     immediateFetchWorkItem?.cancel()
     immediateFetchWorkItem = nil
@@ -264,13 +261,13 @@ class AutomationManager: NSObject, ObservableObject {
   // 即時 fetch と API 応答待機の両方を潰して、新ページへの移行と in-flight 処理を分離する
   private func cancelAllInFlightFetches() {
     cancelImmediateFetch()
-    cancelPendingAPIWait()
+    invalidateInFlightFetch()
     pendingLoadURL = nil
   }
 
   func scheduleImmediateFetch() {
-    // didFinish 経由で呼ばれる。ページ描画が落ち着くのを postLoadDelaySeconds 待ってから
-    // tick を発火し、使用量更新ボタン押下 → API レスポンス待機の流れに乗せる
+    // didFinish 経由で呼ばれる。ログイン直後の複数ナビゲーション等で didFinish が
+    // 連発しても tick が重複発火しないよう postLoadDelaySeconds だけ寝かせて 1 回へ coalesce する
     immediateFetchWorkItem?.cancel()
     appLogDebug("\(Int(Self.postLoadDelaySeconds)) 秒後に tick をスケジュール")
     let item = DispatchWorkItem { [weak self] in self?.tick() }
@@ -328,10 +325,17 @@ class AutomationManager: NSObject, ObservableObject {
   func clearSessionAndReload() {
     appLog("セッションクリア実行")
     cancelAllInFlightFetches()
+    // セッションが変われば org も変わり得るためキャッシュを破棄する (要件 3)
+    cachedOrgUuid = nil
     let store = WKWebsiteDataStore.default()
     store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) {
       DispatchQueue.main.async { [weak self] in
-        guard let self, let url = URL(string: self.settings.url) else { return }
+        guard let self else { return }
+        // removeData は非同期のため、クリア開始〜完了の間に走った tick が消えかけの cookie で
+        // fetch に成功し org uuid を再キャッシュし得る。リロード直前に無効化・破棄をやり直す
+        self.invalidateInFlightFetch()
+        self.cachedOrgUuid = nil
+        guard let url = URL(string: self.settings.url) else { return }
         self.webView.load(URLRequest(url: url))
       }
     }
@@ -379,51 +383,133 @@ class AutomationManager: NSObject, ObservableObject {
       return
     }
 
-    guard settings.matches(url: webView.url) else {
-      appLogDebug("tick skip: 現在URL不一致 \(webView.url?.absoluteString ?? "nil")")
-      applyNotOnSettingsPage()
+    guard Self.isClaudeAiPage(webView.url) else {
+      appLogDebug("tick skip: claude.ai 以外を表示中 \(webView.url?.absoluteString ?? "nil")")
+      applyNotOnClaudePage()
       return
     }
 
-    // API 応答待機スロットを差し替える。前回 tick の未解決スロットがあれば捨てる
-    cancelPendingAPIWait()
-    pendingAPIHandler = { [weak self] data in
-      self?.handleCapturedAPIResponse(data)
-    }
-    let timeoutItem = DispatchWorkItem { [weak self] in
-      self?.applyAPIResponseTimeout()
-    }
-    pendingAPITimeoutWorkItem = timeoutItem
-    DispatchQueue.main.asyncAfter(deadline: .now() + Self.apiResponseTimeoutSeconds, execute: timeoutItem)
-    appLogDebug("API 応答待機スロット準備完了 (timeout=\(Int(Self.apiResponseTimeoutSeconds))s)")
+    beginUsageFetch()
+  }
 
-    // ボタン未検出時は false を返し、API レスポンスタイムアウトを待たず即失敗させる
-    let clickJS = """
-    (function() {
-      const btn = document.querySelector('\(Self.refreshButtonSelector)');
-      if (!btn) { return false; }
-      btn.click();
-      return true;
-    })();
-    """
-    appLogDebug("使用量更新ボタン押下")
-    webView.evaluateJavaScript(clickJS) { [weak self] result, error in
-      guard let self else { return }
-      // pending スロット解決済み (capture 先着 / timeout 先行 / tick キャンセル) 後に届いた
-      // コールバックからは成否を反映しない (1 tick あたり成否反映 1 回の不変条件を守る)
-      guard self.pendingAPIHandler != nil else { return }
-      if let error {
-        self.appLogWarn("JS 評価エラー: \(error)")
-        self.cancelPendingAPIWait()
+  // 2 段 fetch (organizations → usage) の JS を発行し、結果を 1 回だけ状態へ反映する。
+  // 多重発行・reload との競合は usageFetchGeneration で無効化する
+  private func beginUsageFetch() {
+    invalidateInFlightFetch()
+    let generation = usageFetchGeneration
+
+    let watchdog = DispatchWorkItem { [weak self] in
+      guard let self, generation == self.usageFetchGeneration else { return }
+      self.invalidateInFlightFetch()
+      self.appLogWarn("usage fetch watchdog 発火 (\(Int(Self.fetchWatchdogSeconds))s)")
+      self.applyFailure(reason: .fetchTimeout)
+    }
+    usageFetchWatchdogWorkItem = watchdog
+    DispatchQueue.main.asyncAfter(deadline: .now() + Self.fetchWatchdogSeconds, execute: watchdog)
+
+    appLogDebug("usage fetch 開始 (org=\(cachedOrgUuid ?? "未解決"))")
+    webView.callAsyncJavaScript(
+      Self.usageFetchJS,
+      arguments: [
+        "orgUuid": cachedOrgUuid ?? "",
+        "timeoutMs": Int(Self.fetchTimeoutSeconds * 1000),
+        "previewLength": Self.bodyPreviewMaxLength,
+      ],
+      in: nil,
+      in: .defaultClient
+    ) { [weak self] result in
+      // completion は main thread で呼ばれる (appLog 系ヘルパの main.async 一本化方針と整合)
+      guard let self, generation == self.usageFetchGeneration else { return }
+      self.invalidateInFlightFetch()
+      switch result {
+      case .failure(let error):
+        self.appLogWarn("usage fetch JS 実行エラー: \(error)")
         self.applyFailure(reason: .javaScriptError)
+      case .success(let value):
+        self.handleUsageFetchResult(value)
+      }
+    }
+  }
+
+  // JS の resolve 値を分類する。JS は生の事実 (status/contentType/redirected/body) だけを返し、
+  // 失敗の意味づけ (未ログイン判定・カウント加算) はすべてここで行う
+  private func handleUsageFetchResult(_ value: Any?) {
+    guard let dict = value as? [String: Any] else {
+      appLogWarn("usage fetch: 戻り値が想定外 \(String(describing: value))")
+      applyFailure(reason: .javaScriptError)
+      return
+    }
+    let redirected = (dict["redirected"] as? Bool) ?? false
+    let contentType = (dict["contentType"] as? String) ?? ""
+    let status = dict["status"] as? Int
+
+    if (dict["ok"] as? Bool) == true {
+      // HTTP 200 でも非 JSON (ログイン HTML へのリダイレクト等) は未ログイン扱い (防御的判定)
+      guard contentType.contains("json") else {
+        appLogWarn("usage fetch: 非 JSON 応答 contentType=\(contentType) redirected=\(redirected)")
+        applyLoginRequired()
         return
       }
-      if (result as? Bool) != true {
-        self.appLogWarn("使用量更新ボタンが見つかりません: \(Self.refreshButtonSelector)")
-        self.cancelPendingAPIWait()
-        self.applyFailure(reason: .buttonNotFound)
+      if let uuid = dict["orgUuid"] as? String, !uuid.isEmpty {
+        if cachedOrgUuid == nil {
+          let count = dict["orgCount"] as? Int
+          appLogDebug("org uuid 解決: \(uuid)\(count.map { " (\($0) 件中先頭を採用)" } ?? "")")
+        }
+        cachedOrgUuid = uuid
       }
+      guard let body = dict["body"] as? String, let data = body.data(using: .utf8) else {
+        applyFailure(reason: .javaScriptError)
+        return
+      }
+      handleUsageResponseBody(data)
+      return
     }
+
+    // ok == false: JS が返した stage / kind をもとに分類する
+    let stage = UsageFetchStage(rawValue: (dict["stage"] as? String) ?? "") ?? .organizations
+    let kind = (dict["kind"] as? String) ?? "unknown"
+    let bodyHead = dict["bodyHead"] as? String
+    appLogDebug("usage fetch 失敗詳細: stage=\(stage.rawValue) kind=\(kind) status=\(status.map(String.init) ?? "-") contentType=\(contentType) redirected=\(redirected) bodyHead=\(bodyHead ?? "-")")
+    classifyAndApplyFetchFailure(stage: stage, kind: kind, status: status, contentType: contentType)
+  }
+
+  // JS の ok:false 結果を FailureReason / loginRequired に分類する。政策判断をこの 1 箇所に集約する。
+  // 未ログイン時の実応答は防御的に判定する (401/403 と 200+非JSON の両様をカバー)。
+  // 実測結果が想定と異なる場合はこの関数のみ調整すればよい
+  private func classifyAndApplyFetchFailure(stage: UsageFetchStage, kind: String, status: Int?, contentType: String) {
+    if let status, status == 401 || status == 403 {
+      applyLoginRequired()
+      return
+    }
+    if kind == "parse", !contentType.contains("json") {
+      // organizations 段が HTTP 200 でログインページ HTML を返すケースの防御
+      applyLoginRequired()
+      return
+    }
+    switch kind {
+    case "http":
+      if stage == .usage, status == 404 {
+        // org 消滅・権限喪失。次 tick で再解決させる
+        cachedOrgUuid = nil
+      }
+      applyFailure(reason: .claudeApiHttpError(stage: stage, status: status ?? -1))
+    case "timeout":
+      applyFailure(reason: .fetchTimeout)
+    case "network":
+      applyFailure(reason: .fetchNetworkError)
+    case "parse", "noOrg":
+      applyFailure(reason: .orgResolutionFailed)
+    default:
+      // 想定外の kind (JS 側の戻り値形が壊れている等)
+      applyFailure(reason: .javaScriptError)
+    }
+  }
+
+  // ログイン状態の変化を陽性検出した (401/403、または 200+非JSON 応答)。
+  // 再ログイン後は別アカウントの可能性があるため org キャッシュも破棄する
+  private func applyLoginRequired() {
+    cachedOrgUuid = nil
+    applyStatus(.red(.loginRequired))
   }
 
   // プラン判定。Enterprise は five_hour/seven_day が両方 null + extra_usage.is_enabled==true。
@@ -539,13 +625,13 @@ class AutomationManager: NSObject, ObservableObject {
     return calendar.date(from: next)
   }
 
-  // tick 中に届いた /api/organizations/.../usage レスポンス本体を処理する。
+  // usage fetch 成功時のレスポンス本体を処理する。
   // 正常系は UsageData を作って書き込み/POST、異常系は applyFailure
-  private func handleCapturedAPIResponse(_ data: Data) {
+  private func handleUsageResponseBody(_ data: Data) {
     guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
       // パース失敗時は生ボディの先頭を DEBUG でダンプ (原因調査用)
-      let preview = String(data: data.prefix(400), encoding: .utf8) ?? "<not utf8>"
-      appLogDebug("usageAPI JSON パース失敗 preview=\(preview)")
+      let preview = String(data: data.prefix(Self.bodyPreviewMaxLength), encoding: .utf8) ?? "<not utf8>"
+      appLogDebug("usage JSON パース失敗 preview=\(preview)")
       applyFailure(reason: .jsonParseError)
       return
     }
@@ -556,7 +642,7 @@ class AutomationManager: NSObject, ObservableObject {
       if v is [String: Any] { return "\(k)=dict" }
       return "\(k)=\(type(of: v ?? ""))"
     }.joined(separator: ", ")
-    appLogDebug("usageAPI JSON パース成功 keys: \(keySummary)")
+    appLogDebug("usage JSON パース成功 keys: \(keySummary)")
 
     guard let (usage, snapshot) = buildUsagePayload(from: json) else {
       appLogDebug("buildUsagePayload 失敗 (classifyPlan=nil または utilization 欠落)")
@@ -580,7 +666,7 @@ class AutomationManager: NSObject, ObservableObject {
     }
   }
 
-  // fetch 成功時のサマリを INFO ログに出す。handleCapturedAPIResponse 本体を
+  // fetch 成功時のサマリを INFO ログに出す。handleUsageResponseBody 本体を
   // 「構築 → ログ → encode → 書き込み/POST」の骨格で読めるように分離してある
   private func logFetchSuccess(_ usage: UsageData) {
     let sessionLabel = usage.sessionPct.map { "\($0)%" } ?? "----"
@@ -588,14 +674,6 @@ class AutomationManager: NSObject, ObservableObject {
     let weeklyLabel = usage.weeklyPct.map { "\($0)%" } ?? "----"
     let wReset = usage.weeklyResetAt ?? "-"
     appLog("fetch 成功: plan=\(usage.plan) session=\(sessionLabel) reset=\(sReset), weekly=\(weeklyLabel) reset=\(wReset)")
-  }
-
-  // タイムアウト時は pending スロットをクリアし失敗扱いにする
-  private func applyAPIResponseTimeout() {
-    pendingAPIHandler = nil
-    pendingAPITimeoutWorkItem = nil
-    appLogWarn("API レスポンスタイムアウト (\(Int(Self.apiResponseTimeoutSeconds))s)")
-    applyFailure(reason: .apiResponseTimeout)
   }
 
   // ファイル書き込み。未設定は skipped、書き込み失敗は failed
@@ -649,12 +727,12 @@ class AutomationManager: NSObject, ObservableObject {
             return
           }
           self?.appLogWarn("API POST 失敗: \(error)")
-          completion(.failed(.networkFailed))
+          completion(.failed(.postNetworkFailed))
           return
         }
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
           self?.appLogWarn("API POST: \(endpointUrl) → \(http.statusCode)")
-          completion(.failed(.httpFailed(http.statusCode)))
+          completion(.failed(.postHttpFailed(http.statusCode)))
           return
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -701,9 +779,9 @@ class AutomationManager: NSObject, ObservableObject {
     webView.load(URLRequest(url: url))
   }
 
-  // URL 不一致 (未ログイン等) は自動リロード誘発ループを避けるため count 加算せず status のみ更新
-  private func applyNotOnSettingsPage() {
-    applyStatus(.red(.notOnSettingsPage))
+  // claude.ai 以外を表示中は自動リロード誘発ループを避けるため count 加算せず status のみ更新
+  private func applyNotOnClaudePage() {
+    applyStatus(.red(.notOnClaudePage))
   }
 
   // URL 未設定も同じく count に影響させない
@@ -841,7 +919,7 @@ final class WebViewCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
       webView.load(URLRequest(url: pendingURL))
       return
     }
-    guard settings.matches(url: webView.url) else { return }
+    guard AutomationManager.isClaudeAiPage(webView.url) else { return }
     automation?.scheduleImmediateFetch()
   }
 
@@ -951,23 +1029,32 @@ enum AutomationStatus {
 enum RedReason {
   case notYetFetched
   case urlNotConfigured
-  case notOnSettingsPage
+  case notOnClaudePage
+  case loginRequired
   case recentFailure(count: Int, lastReason: FailureReason)
 }
 
+// 2 段 fetch のどちらで失敗したか。ログ・失敗分類で使う
+enum UsageFetchStage: String {
+  case organizations  // GET /api/organizations (org uuid 解決)
+  case usage          // GET /api/organizations/{uuid}/usage
+}
+
 enum FailureReason {
-  // URL 不一致は consecutiveFailureCount を加算しない専用パス (applyNotOnSettingsPage) を
-  // 使うため、FailureReason 側の .notOnSettingsPage は廃止。URL 不一致状態の表現は
-  // RedReason.notOnSettingsPage 側のみで行う
-  case javaScriptError           // 使用量更新ボタンクリック JS 失敗
-  case buttonNotFound            // 使用量更新ボタン (refreshButtonSelector) が DOM に見つからない
-  case jsonParseError            // API レスポンス JSON のパース失敗
+  // claude.ai 以外を表示中 / 未ログインは consecutiveFailureCount を加算しない専用パス
+  // (applyNotOnClaudePage / applyLoginRequired) を使うため、FailureReason 側には
+  // 対応する case を持たない。表現は RedReason 側のみで行う
+  case javaScriptError    // usage fetch JS の実行自体が失敗、または戻り値が想定外
+  case fetchTimeout       // JS 側 AbortSignal timeout、または Swift 側 watchdog 発火
+  case fetchNetworkError  // JS fetch の TypeError 等 (オフライン・DNS 失敗など)
+  case claudeApiHttpError(stage: UsageFetchStage, status: Int)  // claude.ai API の HTTP 非 200 (未ログイン分類に該当しないもの)
+  case orgResolutionFailed  // organizations 応答の構造が想定外 (JSON 破損・空配列・uuid 欠落等)
+  case jsonParseError     // usage レスポンス JSON のパース失敗
   case jsonEncodeError
   case fileWriteFailed
-  case httpFailed(Int)
-  case networkFailed
-  case apiResponseTimeout        // click 後 API レスポンスが既定時間内に来ない
-  case unknownPlan               // JSON は来たがプラン判定不能
+  case postHttpFailed(Int)  // API POST (出力側) の HTTP 非 200
+  case postNetworkFailed    // API POST (出力側) の通信エラー
+  case unknownPlan          // JSON は来たがプラン判定不能
 }
 
 // write / POST それぞれの結果。applyCombinedOutcome で集約する
@@ -1030,8 +1117,10 @@ extension AutomationStatus {
       return "取得待機中"
     case .red(.urlNotConfigured):
       return "異常 - URL 未設定"
-    case .red(.notOnSettingsPage):
+    case .red(.notOnClaudePage):
       return "異常 - ページを確認してください"
+    case .red(.loginRequired):
+      return "異常 - 未ログイン (ウィンドウを表示してログイン)"
     case .red(.recentFailure(let count, _)):
       return "異常 - 取得失敗 (\(count)/3)"
     }
@@ -1041,34 +1130,6 @@ extension AutomationStatus {
 extension AutomationManager {
   static func statusTimeString(from date: Date) -> String {
     statusTimeFormatter.string(from: date)
-  }
-}
-
-// MARK: - WKScriptMessageHandler
-// /api/organizations/.../usage の fetch/XHR レスポンスを JS ラッパから受け取るハンドラ。
-// tick 中 (pendingAPIHandler がセット済み) の capture のみを採用し、それ以外はログのみで破棄する
-extension AutomationManager: WKScriptMessageHandler {
-  func userContentController(_ uc: WKUserContentController, didReceive message: WKScriptMessage) {
-    guard message.name == "usageAPI" else { return }
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self,
-            let dict = message.body as? [String: Any],
-            let body = dict["body"] as? String,
-            let data = body.data(using: .utf8) else { return }
-
-      let url = (dict["url"] as? String) ?? "?"
-      let status = (dict["status"] as? Int) ?? -1
-      let pendingLabel = self.pendingAPIHandler != nil ? "pending" : "passive"
-      self.appLogDebug("usageAPI 受信 [\(pendingLabel)] status=\(status) bytes=\(data.count) url=\(url)")
-
-      if let handler = self.pendingAPIHandler {
-        self.cancelPendingAPIWait()
-        handler(data)
-      } else {
-        // tick 外で届いた capture は lastUsage を更新しない (consecutiveFailureCount の管理単純化)
-        self.appLogDebug("usageAPI: pending 外の capture を破棄")
-      }
-    }
   }
 }
 
@@ -1089,58 +1150,57 @@ extension Date {
   }
 }
 
-// MARK: - Intercept JS
+// MARK: - Usage Fetch JS
 extension AutomationManager {
-  // atDocumentStart で注入する fetch / XMLHttpRequest ラッパ。
-  // /api/organizations/.../usage の URL に一致したら response.clone() から body を読み取り
-  // window.webkit.messageHandlers.usageAPI.postMessage で Swift に転送する。
-  // - 観測専用 (read-only tap): 元 response は無加工で page に返し DOM 更新やデータフローに干渉しない
-  // - 例外は全て握りつぶす (ラッパがページ挙動を壊さないことを最優先)
-  static let interceptUsageJS: String = """
-  (function() {
-    const USAGE_RE = /\\/api\\/organizations\\/[^/]+\\/usage(\\?|$)/;
-
-    const origFetch = window.fetch;
-    window.fetch = function(...args) {
-      return origFetch.apply(this, args).then(response => {
-        try {
-          const url = response.url || (typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url));
-          if (url && USAGE_RE.test(url)) {
-            response.clone().text().then(body => {
-              try {
-                window.webkit.messageHandlers.usageAPI.postMessage({
-                  url: url, body: body, status: response.status
-                });
-              } catch (e) {}
-            }).catch(() => {});
-          }
-        } catch (e) {}
-        return response;
-      });
+  // callAsyncJavaScript の async function body。
+  // arguments: orgUuid (String, 空文字 = 未解決) / timeoutMs (Int) / previewLength (Int)。
+  // JS は reject せず、常に plist 互換の flat な辞書を resolve で返す。失敗の意味づけ
+  // (未ログイン判定等) は Swift 側 classifyAndApplyFetchFailure に集約する。
+  // organizations 段の JSON.parse 失敗も kind="parse" + contentType の生値で返すだけにし、
+  // 「非 JSON = 未ログイン」の解釈は Swift 側に委ねる
+  static let usageFetchJS: String = """
+  const fetchJson = async (path) => {
+    const res = await fetch(path, { signal: AbortSignal.timeout(timeoutMs) });
+    return {
+      status: res.status,
+      contentType: res.headers.get('content-type') || '',
+      redirected: res.redirected,
+      body: await res.text(),
     };
-
-    const OrigXHR = window.XMLHttpRequest;
-    function WrappedXHR() {
-      const xhr = new OrigXHR();
-      let capturedUrl = null;
-      const origOpen = xhr.open;
-      xhr.open = function(method, url, ...rest) {
-        capturedUrl = url;
-        return origOpen.call(xhr, method, url, ...rest);
-      };
-      xhr.addEventListener('load', function() {
-        try {
-          if (capturedUrl && USAGE_RE.test(capturedUrl)) {
-            window.webkit.messageHandlers.usageAPI.postMessage({
-              url: capturedUrl, body: xhr.responseText || '', status: xhr.status
-            });
-          }
-        } catch (e) {}
-      });
-      return xhr;
+  };
+  const failure = (stage, kind, res, extra) => ({
+    ok: false, stage, kind,
+    status: res ? res.status : -1,
+    contentType: res ? res.contentType : '',
+    redirected: res ? res.redirected : false,
+    bodyHead: res ? res.body.slice(0, previewLength) : '',
+    ...(extra || {}),
+  });
+  let stage = 'organizations';
+  try {
+    let uuid = orgUuid;
+    if (!uuid) {
+      const res = await fetchJson('/api/organizations');
+      if (res.status !== 200) { return failure(stage, 'http', res); }
+      let orgs;
+      try { orgs = JSON.parse(res.body); } catch (e) { return failure(stage, 'parse', res); }
+      if (!Array.isArray(orgs) || orgs.length === 0 || !orgs[0] || !orgs[0].uuid) {
+        return failure(stage, 'noOrg', res);
+      }
+      // org 選択ポリシー: 先頭の org を採用。複数 org 対応時はここを設定値参照に差し替える
+      uuid = orgs[0].uuid;
+      var orgCount = orgs.length;
     }
-    WrappedXHR.prototype = OrigXHR.prototype;
-    window.XMLHttpRequest = WrappedXHR;
-  })();
+    stage = 'usage';
+    const res = await fetchJson('/api/organizations/' + uuid + '/usage');
+    if (res.status !== 200) { return failure(stage, 'http', res, { orgUuid: uuid }); }
+    return {
+      ok: true, orgUuid: uuid, orgCount: (typeof orgCount === 'number' ? orgCount : -1),
+      status: res.status, contentType: res.contentType, redirected: res.redirected, body: res.body,
+    };
+  } catch (e) {
+    const kind = (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) ? 'timeout' : 'network';
+    return failure(stage, kind, null, { error: String(e) });
+  }
   """
 }

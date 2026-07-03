@@ -1,8 +1,7 @@
 # DEVELOPMENT.md
 
-今後の追加開発・保守で読んでおくべき事項を網羅的に記録。
-
-最終更新: 2026-07-03 JST
+設計判断・運用ポリシー・外部依存のリスクなどの記録。
+クラス構成や個々のメソッドの詳細はソースコード（コメント含む）を参照すること。
 
 ---
 
@@ -12,26 +11,19 @@
 
 ```
 ClaudeUsageMonitorApp (@main)
-  ├─ AppSettings         … UserDefaults 永続化、matches(url:) 判定、defaultUrl / warningThresholdPct
-  ├─ LogStore            … アプリ内ログ（@MainActor、FIFO 最大 1000 行、LogLevel 閾値）
-  └─ AutomationManager   … 共有 WKWebView / WebViewCoordinator 所有
-                          AppKit NSWindow 所有（mainWindow）+ NSWindowDelegate
-                          タイマー、JS 実行、データ処理、送信
-                          Combine 購読、@Published status / @Published lastUsage
-                          UNUserNotificationCenter で使用率警告通知を送出
-                          statusBarColor（green/orange/red）を計算
-                          appLog / appLogDebug / appLogWarn / appLogError ヘルパで LogStore へ記録
+  ├─ AppSettings         … UserDefaults 永続化
+  ├─ LogStore            … アプリ内ログ（詳細は「ログアーキテクチャ」）
+  └─ AutomationManager   … 共有 WKWebView / WebViewCoordinator / メインウィンドウ用 NSWindow を
+                          強参照で所有する SoT。タイマー・fetch・状態管理を統括（詳細は各セクション）
 
 Scene 構成 (3 つ):
   ├─ MenuBarExtra              … 常駐アイコン（NSImage 自前描画）+ MenuContentView
-  ├─ Window(id: "log")         … LogView（初期 700x500、リサイズ可、.defaultLaunchBehavior(.suppressed)）
+  ├─ Window(id: "log")         … LogView（.defaultLaunchBehavior(.suppressed) で起動時は開かない）
   └─ Settings                  … SettingsView
 
 メイン WebView ウィンドウ（SwiftUI Scene ではない）:
-  AutomationManager が AppKit NSWindow を直接生成・所有し、
-  contentView に共有 WKWebView を attach。
-  起動時に alphaValue=0 + orderFrontRegardless で「不可視だが on screen」扱いに保つ
-  （hide しない = WKWebView の throttle 回避）。
+  AutomationManager が AppKit NSWindow を直接生成・所有し、共有 WKWebView を attach する。
+  SwiftUI Window Scene を使わない理由は「過去にハマった問題 #6」参照。
 
 OAuth ポップアップ（navigationDelegate 経由で生成される別ウィンドウ）:
   OAuthPopupController（ContentView.swift に定義）が NSWindow + WKWebView を生成。
@@ -40,27 +32,25 @@ OAuth ポップアップ（navigationDelegate 経由で生成される別ウィ�
 ※ 正常状態（Normalアイコン時）= green, 警告状態（Orangeアイコン時）= orange, 異常状態（Redアイコン時）= red と表現する。
 
 - `AutomationManager` が `WKWebView` / `WebViewCoordinator` / メインウィンドウ用 `NSWindow` / `LogStore` 参照を**強参照**で所有する（SoT）
-- メイン WebView ウィンドウは SwiftUI Scene ではなく AppKit `NSWindow`。`styleMask = [.titled, .closable, .resizable]`、`contentView = webView`
-- ウィンドウを「閉じる」操作は `NSWindowDelegate.windowShouldClose` で `false` を返してインターセプトし、`hideMainWindow()` で `alphaValue = 0` + `ignoresMouseEvents = true` による不可視化に置き換える（= 破棄はしない）
-- 「ウィンドウを表示」は `center()` + `alphaValue = 1` + `makeKeyAndOrderFront` + `NSApp.activate` で画面中央に前面表示。ユーザーがリサイズしたサイズを保持するため `setContentSize` は呼ばない
-- `WebViewCoordinator` は `AppSettings` / `LogStore` の参照を持ち、ナビゲーション監視・ループ検出に加えて `appLog` 系ヘルパ（AutomationManager と同じディスパッチ方式）でログも記録
-- Timer のライフサイクルは View 非依存。`AutomationManager.init` 末尾で `start()` を発火し、アプリ終了まで停止しない
+- メインウィンドウの不可視化・再表示（閉じる操作のインターセプト、hide/show の実装）は「過去にハマった問題 #6」に理由と仕組みをまとめている
+- `WebViewCoordinator` は `AppSettings` / `LogStore` の参照を持ち、ナビゲーション監視・ループ検出に加えて `appLog` 系ヘルパ（AutomationManager と同じディスパッチ方式）でログも記録する
+- Timer のライフサイクルは View 非依存。詳細は「Timer ライフサイクル」セクション参照
 
 ### 各クラスの責務
 
+各クラスのプロパティ・メソッドはソースコード（およびコメント）を参照。ここではクラス間の役割分担のみを一覧化する。
+
 | クラス / 構造体 | 役割 |
 |----------------|------|
-| `ClaudeUsageMonitorApp` | SwiftUI エントリポイント。`AppSettings` / `LogStore` / `AutomationManager` を `StateObject` で生成し、`MenuBarExtra` / `Window(id: "log")` / `Settings` の 3 Scene を宣言。`statusBarIcon(color:)` で `Assets.xcassets/StatusBarIcon` のシルエットを取り、`.green` は `isTemplate = true` で macOS 自動色、`.orange` / `.red` は CGContext の `.sourceIn` ブレンドで `systemOrange` / `systemRed` に上書きして返す。素材読み込み失敗時のみ `fallbackDotIcon(color:)` で従来の塗り丸へフォールバック |
-| `MenuContentView` | MenuBarExtra の中身。先頭に使用率サマリをプランに応じて表示する `summaryRows` ビュー（Individual: 4 行 / Enterprise: 2 行）に続き、状態ラベル、4 つのメニュー項目（ウィンドウを表示 / 手動更新 / 設定… / ログ）+ 区切り + 終了。`sessionResetFormatter` (`H:mm`) と `weeklyResetFormatter` (`M/d (E) H:mm` / `ja_JP`) を同居し、両者とも `timeZone = Asia/Tokyo` を固定。`automation.lastUsage` が nil の場合は individual レイアウト扱いで `----` プレースホルダを 4 行表示 |
-| `LogView` | ログウィンドウ UI。`LogStore.entries` を 1 つの `Text` にまとめて `textSelection(.enabled)` で複数行選択可。`ScrollViewReader` + 末尾マーカー (`Color.clear` + `id`) で新規追記時と表示直後に自動末尾スクロール。ヘッダに「N / 1000 行」と「クリア」ボタン |
-| `LogStore` | `@MainActor` 固定の `ObservableObject`。`@Published private(set) var entries: [LogEntry]`、最大 `maxEntries = 1000` の FIFO（先頭から `removeFirst` で調整）、`lineCounter` による絶対行番号、`minLevel` 閾値でフィルタ、`log(_:level:)` / `clear()` を提供 |
-| `LogEntry` | `Identifiable, Equatable`。`id` / `lineNumber` / `timestamp` / `message` / `level` を保持。`formatted` 計算プロパティで `NNNNN  HH:mm:ss [LEVEL]  message` の表示文字列を返す |
-| `LogLevel` | `Int` raw + `Comparable` enum。`.debug` / `.info` / `.warn` / `.error`。`label` で 5 文字幅（`INFO ` / `WARN ` 等）の固定幅ラベルを返す |
-| `OAuthPopupController` | OAuth ポップアップ用の `NSWindow` + `WKWebView`。`ContentView.swift` 内に定義。ウィンドウクローズをポーリングで検出し `onClose` を呼ぶ |
-| `AutomationManager` | `NSObject` サブクラス。`WKScriptMessageHandler` 実装（`usageAPI` 名で `/api/organizations/.../usage` の傍受メッセージを受信）、共有 `WKWebView` / `WebViewCoordinator` / メインウィンドウ用 `NSWindow` / `LogStore` 参照の所有、`NSWindowDelegate` 実装（windowShouldClose で hide 置換）、`installMainWindow` / `showMainWindow` / `hideMainWindow`、タイマー制御、`tick()` → ボタンクリック JS → API レスポンス待機（`pendingAPIHandler` + 10 秒 timeout）、プラン判定 → パース、ファイル出力、HTTP POST（-1009 リトライ付き）、失敗カウント、セッションクリア、`@Published status` / `@Published lastUsage: UsageSnapshot?`、computed `statusBarColor: StatusBarColor`、`runManualFetch()`、init で `WKUserContentController` に fetch/XHR ラッパ JS を `.atDocumentStart` で登録、init 末尾で `UNUserNotificationCenter.requestAuthorization`、`applyStatus` 末尾の `notifyIfOrangeTransition()` で Orange 遷移時のみユーザー通知を 1 回発火、`appLog` / `appLogDebug` / `appLogWarn` / `appLogError` ヘルパ |
-| `WebViewCoordinator` | `WKNavigationDelegate` / `WKUIDelegate`。OAuth ポップアップ生成、`didFinish` で即時 fetch スケジュール、`decidePolicyFor` でのループ検出。`LogStore` を保持し `appLog` 系ヘルパ（AutomationManager と同じディスパッチ方式）でログ記録 |
-| `AppSettings` | `UserDefaults` 永続化。`@Published` プロパティの `didSet` で自動保存。`matches(url:)` で設定 URL と任意 URL を host+path 比較。`static let defaultUrl = "https://claude.ai/settings/usage"` を公開し、`url` の初期値と `SettingsView` の placeholder から共通参照。`warningThresholdPct`（Int、初期値 90、`Keys.warningThresholdPct`）も併せて永続化 |
-| `SettingsView` | 設定画面 UI（URL、間隔、API エンドポイント、ファイル名、警告閾値）。`@State` の編集バッファを持ち、**Save で commit / Cancel で破棄**する方式。`warningThresholdDraft` は `Stepper` で 1〜100% を 1 刻み。フィールド変更は INFO、Save / Cancel ボタン操作は DEBUG で `appLog` する。Save/Cancel 行はバッファ方式フィールドの直下に配置し、その下（Divider 区切り）に Save/Cancel 対象外の即時動作ボタンを並べる: ログイン時起動トグル（Button スタイル、`SMAppService.mainApp` 経由で即時 register / unregister）、セッションクリア |
+| `ClaudeUsageMonitorApp` | SwiftUI エントリポイント。3 つの Scene を宣言し、状態色に応じたメニューバーアイコンを描画する（詳細は「メニューバーアイコンのシルエット生成」） |
+| `MenuContentView` | MenuBarExtra の中身。プランに応じた使用率サマリと操作メニューを表示する（詳細は「UsagePlan と UI 分岐」） |
+| `LogView` / `LogTextView` | ログウィンドウ UI（詳細は「ログアーキテクチャ」） |
+| `LogStore` / `LogEntry` / `LogLevel` | アプリ内ログの保持とレベル定義（詳細は「ログアーキテクチャ」） |
+| `OAuthPopupController` | OAuth ポップアップ用の `NSWindow` + `WKWebView`（`ContentView.swift` 内）。ウィンドウクローズをポーリングで検出し `onClose` を呼ぶ |
+| `AutomationManager` | 共有 WebView・メインウィンドウ・タイマー・fetch・状態遷移を統括する中核クラス（SoT）。詳細は本ドキュメントの各セクション参照 |
+| `WebViewCoordinator` | `WKNavigationDelegate` / `WKUIDelegate`。OAuth ポップアップ生成、即時 fetch のトリガー、ログイン/ログアウトのループ検出を担当 |
+| `AppSettings` | `UserDefaults` 永続化。`url` は表示・ログイン用ページ URL（初回ロード / 手動更新 / 自動リロード / OAuth 復帰先）であり、usage データ取得自体はページに依存しない点に注意 |
+| `SettingsView` | 設定画面 UI。編集バッファ方式を採用する（詳細は「設定画面の保存方式」） |
 
 ---
 
@@ -75,7 +65,7 @@ OAuth ポップアップ（navigationDelegate 経由で生成される別ウィ�
 `AutomationStatus.color` が `StatusColor`（`.green` / `.red`）を返し、自動リロード判定などの統計的な成否判定に使う。`AutomationStatus.text` が表示用文言を返す（計算プロパティ。`status` 以外に状態ソースを増やさないため）。`.green` 時の時刻表記は `HH:mm:ss`（`AutomationManager.statusTimeFormatter`）。
 
 ### `UsageSnapshot`
-`handleCapturedAPIResponse` が成功したときに `AutomationManager.@Published var lastUsage: UsageSnapshot?` にセットされる UI 用スナップショット。`plan: UsagePlan` / `sessionPct: Int?` / `sessionResetAt: Date?` / `weeklyPct: Int?` / `weeklyResetAt: Date?` を保持し、View 側で好きな書式に整形できる。JSON 出力用の `UsageData`（文字列フィールドでフォーマット済み）とは別立てに分けている（責務分離: JSON シリアライゼーションと UI 表示で必要な型が異なるため、`buildUsagePayload(from:)` が両方を同時に構築して返す）。
+`handleUsageResponseBody` が成功したときに `AutomationManager.@Published var lastUsage: UsageSnapshot?` にセットされる UI 用スナップショット。`plan: UsagePlan` / `sessionPct: Int?` / `sessionResetAt: Date?` / `weeklyPct: Int?` / `weeklyResetAt: Date?` を保持し、View 側で好きな書式に整形できる。JSON 出力用の `UsageData`（文字列フィールドでフォーマット済み）とは別立てに分けている（責務分離: JSON シリアライゼーションと UI 表示で必要な型が異なるため、`buildUsagePayload(from:)` が両方を同時に構築して返す）。
 
 ### `UsagePlan`
 `UsageSnapshot` / `UsageData` で保持するプラン種別（`.individual` / `.enterprise`）。`String` rawValue（`"individual"` / `"enterprise"`）が JSON の `plan` フィールドにそのまま出力される。Pro / Max は `.individual` に統一する（区別しない）。判定ロジックは `classifyPlan(json:)` を参照。
@@ -94,22 +84,30 @@ OAuth ポップアップ（navigationDelegate 経由で生成される別ウィ�
 `StatusColor`（`.green` / `.red` の 2 値）は `AutomationStatus.color` 専用。自動リロードや「成功 / 失敗」の二値判定で使われる。アイコン色は `AutomationManager.statusBarColor`（= `StatusBarColor`）を、status 自体の意味論は `AutomationStatus.color`（= `StatusColor`）を使う、と棲み分ける。
 
 ### `RedReason`
-- `.notYetFetched` — 起動直後で一度も成功していない（文言: `取得待機中`）
-- `.urlNotConfigured` — 設定 URL が空（文言: `異常 - URL 未設定`）
-- `.notOnSettingsPage` — URL は設定済みだが現在 WebView のページが一致しない（文言: `異常 - ページを確認してください`）
-- `.recentFailure(count: Int, lastReason: FailureReason)` — 直近 tick が失敗（文言: `異常 - 取得失敗 (n/3)`）
+- `.notYetFetched` — 起動直後で一度も成功していない
+- `.urlNotConfigured` — 設定 URL が空
+- `.notOnClaudePage` — WebView の現在ページが claude.ai origin でない
+- `.loginRequired` — usage fetch の応答から未ログインを陽性検出（401/403、または HTTP 200 だが非 JSON）
+- `.recentFailure(count: Int, lastReason: FailureReason)` — 直近 tick が失敗
+
+ユーザー向けの表示文言は `AutomationStatus.text` が case ごとに持つ（README.md の「状態表示」セクションが正）。
+
+### `UsageFetchStage`
+2 段 fetch のどちらで失敗したかを表す enum（`.organizations` / `.usage`）。ログと `FailureReason.claudeApiHttpError` の関連付けに使う。
 
 ### `FailureReason`
-tick サイクルの各失敗原因を enum で表現する。`.recentFailure` の `lastReason` に埋め込まれる。
+tick サイクルの各失敗原因を enum で表現する。`.recentFailure` の `lastReason` に埋め込まれる。判定は `classifyAndApplyFetchFailure` の 1 箇所に集約する。
 
-- `.javaScriptError` — 使用量更新ボタンクリック JS の実行失敗
-- `.buttonNotFound` — 使用量更新ボタン（`refreshButtonSelector`）が DOM に見つからない（claude.ai 側の aria-label 変更・ページ未描画など）。API レスポンスタイムアウトを待たず即失敗する
-- `.jsonParseError` — 捕捉した API レスポンス本体の JSON パース失敗
+- `.javaScriptError` — `callAsyncJavaScript` の completion が失敗、または戻り値が想定外の形
+- `.fetchTimeout` — JS 側 `AbortSignal.timeout` によるタイムアウト、または Swift 側 watchdog の発火
+- `.fetchNetworkError` — JS fetch の TypeError 等（オフライン・DNS 失敗など）
+- `.claudeApiHttpError(stage: UsageFetchStage, status: Int)` — claude.ai API の HTTP 非 200（未ログイン分類に該当しないもの）
+- `.orgResolutionFailed` — organizations 応答の構造が想定外（JSON 破損・空配列・uuid 欠落等）
+- `.jsonParseError` — usage レスポンス本体の JSON パース失敗
 - `.jsonEncodeError` — `UsageData` エンコード失敗
 - `.fileWriteFailed` — ファイル書き込み失敗
-- `.httpFailed(Int)` — HTTP 非 200 系
-- `.networkFailed` — 通信エラー
-- `.apiResponseTimeout` — ボタンクリック後 10 秒以内に `/api/organizations/.../usage` レスポンスが届かない
+- `.postHttpFailed(Int)` — API POST（出力側）の HTTP 非 200 系
+- `.postNetworkFailed` — API POST（出力側）の通信エラー
 - `.unknownPlan` — レスポンス JSON は届いたがプラン判定不能（`classifyPlan` が nil）
 
 ### `FileOutcome` / `PostOutcome`
@@ -127,16 +125,17 @@ tick サイクルの各失敗原因を enum で表現する。`.recentFailure` �
 |---|---|---|---|
 | `init` 直後 | `.red(.notYetFetched)` | `.red` | 0 |
 | 設定 URL が空で `init` / URL 変更 | `.red(.urlNotConfigured)` | `.red` | 変化なし |
-| `tick()` で URL 不一致 | `.red(.notOnSettingsPage)` | `.red` | 変化なし |
+| `tick()` で claude.ai 以外を表示中 | `.red(.notOnClaudePage)` | `.red` | 変化なし |
+| usage fetch が未ログインを検出（401/403 または 200+非JSON） | `.red(.loginRequired)` | `.red` | 変化なし |
 | `applyCombinedOutcome` が success 判定、使用率 < 閾値 | `.green(lastSuccessAt: Date())` | `.green` | 0 にリセット |
 | `applyCombinedOutcome` が success 判定、session% または weekly% ≥ 閾値 | `.green(lastSuccessAt: Date())` | `.orange`（前回 `.orange` 以外なら通知 1 回発火） | 0 にリセット |
 | `applyCombinedOutcome` が failed 判定 | `.red(.recentFailure(count, lastReason))` | `.red` | +1。3 以上で自動リロード |
 | `.skipped` のみ | `applyCombinedOutcome` 内で success 扱い | 使用率による | 0 にリセット |
-| クリック JS で使用量更新ボタンが見つからない | `.red(.recentFailure(count, .buttonNotFound))` | `.red` | +1。3 以上で自動リロード |
-| ボタンクリック後 10 秒で API レスポンスなし | `.red(.recentFailure(count, .apiResponseTimeout))` | `.red` | +1。3 以上で自動リロード |
+| usage fetch JS の実行失敗・戻り値想定外 | `.red(.recentFailure(count, .javaScriptError))` | `.red` | +1。3 以上で自動リロード |
+| JS 側 timeout または Swift 側 watchdog 発火 | `.red(.recentFailure(count, .fetchTimeout))` | `.red` | +1。3 以上で自動リロード |
 | 届いた API JSON がプラン判定不能 | `.red(.recentFailure(count, .unknownPlan))` | `.red` | +1。3 以上で自動リロード |
 
-**重要**: `.notOnSettingsPage` と `.urlNotConfigured` は `consecutiveFailureCount` に加算されず、3 回連続失敗リロードの対象外。未ログイン状態での無限リロードループを避けるため。
+**重要**: `.notOnClaudePage` と `.urlNotConfigured` と `.loginRequired` は `consecutiveFailureCount` に加算されず、3 回連続失敗リロードの対象外。未ログイン状態での無限リロードループを避けるため。
 
 **StatusBarColor は status の派生**: 上表の `StatusBarColor` 列は `applyStatus` 完了後に `statusBarColor` computed プロパティで再計算される。`notifyIfOrangeTransition()` は `applyStatus` 末尾で呼ばれ、`previousStatusBarColor != .orange && current == .orange` の瞬間に限り通知を送る。
 
@@ -147,7 +146,7 @@ tick サイクルの各失敗原因を enum で表現する。`.recentFailure` �
 `SettingsView` は**編集バッファ方式**を採用する。
 
 ### 構造
-- `@State` プロパティ（`urlDraft` / `intervalDraft` / `apiEndpointDraft` / `monitoringFileNameDraft`）を画面内に保持
+- `@State` プロパティ（`urlDraft` / `intervalDraft` / `apiEndpointDraft` / `monitoringFileNameDraft` / `warningThresholdDraft`）を画面内に保持
 - `onAppear` の `loadDrafts()` で `AppSettings` の現在値をバッファへロード
 - フォームの各フィールドはバッファを双方向バインドするだけで、`AppSettings.@Published` には直接書き込まない
 - 「SAVE」ボタン押下時のみ `commit()` で一括書き戻し → `AppSettings` の `didSet` が発火し `UserDefaults` と Combine 購読者（`AutomationManager` の interval / url sink）にまとめて通知される
@@ -171,11 +170,11 @@ tick サイクルの各失敗原因を enum で表現する。`.recentFailure` �
 
 ## 外部依存箇所（claude.ai の API / 挙動）
 
-以下の URL パターン・JSON 構造・ボタン要素に依存しているため、claude.ai 側の変更で動作しなくなる可能性がある。
+以下の API パス・JSON 構造に依存しているため、claude.ai 側の変更で動作しなくなる可能性がある（DOM 要素には非依存）。
 
-### API エンドポイント依存（`AutomationManager.interceptUsageJS` の傍受対象）
-- URL パターン（JS の `USAGE_RE` 正規表現）: `/api/organizations/[^/]+/usage(\?|$)`
-- レスポンス JSON の主要キー:
+### API 直接呼び出し先（`AutomationManager.usageFetchJS` が same-origin fetch で呼ぶ）
+- `GET /api/organizations` … org uuid 解決。レスポンスは org オブジェクトの配列で、先頭要素の `uuid` を採用する（`cachedOrgUuid` にキャッシュ）
+- `GET /api/organizations/{uuid}/usage` … 使用量本体。レスポンス JSON の主要キー:
   - `five_hour`（Individual: 5 時間セッション。null の場合あり）
     - `utilization: Double` … 使用率（0〜100）
     - `resets_at: String`（ISO 8601）… `utilization: 0.0` 時は null になり得る
@@ -189,9 +188,6 @@ tick サイクルの各失敗原因を enum で表現する。`.recentFailure` �
   - `five_hour != nil || seven_day != nil` → `.individual`（片側 null は null フィールドで表現）
   - `five_hour == nil && seven_day == nil && extra_usage.is_enabled == true` → `.enterprise`
   - それ以外 → nil（`.unknownPlan` 失敗）
-
-### 使用量更新ボタン
-- `button[aria-label="更新"]`（`AutomationManager.refreshButtonSelector` に一元化）… `tick()` で click（ページ側が `/usage` API を叩く契機）。ボタンが見つからない場合はクリック JS が false を返し `.buttonNotFound` で即失敗する
 
 ### ナビゲーションループ検出対象 URL（`WebViewCoordinator.decidePolicyFor`）
 - URL 文字列に `/login` または `/logout` を含むもの
@@ -237,19 +233,13 @@ API レスポンスの `resets_at`（ISO 8601）を `Date.roundedToNearestHour()
 
 ## 失敗検出・自動リカバリの仕組み
 
-### 失敗検出のパス
+### 失敗判定の一元化
 
-1. **URL 不一致**（`tick()` 先頭）: `settings.matches(url: webView.url)` で現在 URL のホスト+パスが設定 URL と一致するか確認。不一致なら `applyNotOnSettingsPage()` に流す。**`consecutiveFailureCount` には加算せず**、3 回連続失敗リロードの対象外。
-2. **JS 実行失敗**（click JS の `evaluateJavaScript` コールバック）: `applyFailure(reason: .javaScriptError)`。
-3. **ボタン未検出**（click JS が false を返す）: `applyFailure(reason: .buttonNotFound)`。API レスポンスタイムアウトを待たず即失敗する（claude.ai 側の aria-label 変更やページ未描画の検知用）。
-4. **API レスポンス タイムアウト**（10 秒）: `applyFailure(reason: .apiResponseTimeout)`。ボタンクリック後に `/api/organizations/.../usage` が捕捉できなかった場合（未ログイン・別ページ遷移・サーバ遅延など）。
-5. **JSON パース失敗**（`handleCapturedAPIResponse`）: `applyFailure(reason: .jsonParseError)`。
-6. **プラン判定不能**: `applyFailure(reason: .unknownPlan)`。
-7. **JSON エンコード失敗**・**ファイル書き込み失敗**・**HTTP 非 200**・**通信エラー**も `applyFailure(reason:)` を呼ぶ。
+tick サイクルで発生し得る失敗はすべて `classifyAndApplyFetchFailure`（またはページ不一致・URL 未設定・未ログイン用の専用パス `applyNotOnClaudePage` / `applyURLNotConfigured` / `applyLoginRequired`）に集約される。各失敗理由の意味は「状態モデル」の `FailureReason` 一覧を参照。新しい失敗パスを追加する際もこの集約ポイントに寄せること（分散させると「状態遷移ルール」表との整合が崩れる）。
 
 ### write と POST の独立実行
 
-`handleCapturedAPIResponse` は取得成功後に以下を**独立して試行**する:
+`handleUsageResponseBody` は取得成功後に以下を**独立して試行**する:
 
 - `writeUsageFileIfNeeded(_:)` → `FileOutcome` を同期的に返す
 - `postToAPIIfNeeded(_:completion:)` → 非同期コールバックで `PostOutcome` を返す
@@ -265,7 +255,7 @@ API レスポンスの `resets_at`（ISO 8601）を `Date.roundedToNearestHour()
 - `consecutiveFailureCount` が 3 以上 かつ `OAuthPopupController.active.isEmpty` で設定 URL にリロード
 - リロード後は `consecutiveFailureCount = 0` にリセット
 - 成功時も `consecutiveFailureCount = 0` にリセット
-- `.notOnSettingsPage` / `.urlNotConfigured` は count 非加算なので、このパスでは 3 回リロードが発火しない
+- `.notOnClaudePage` / `.urlNotConfigured` / `.loginRequired` は count 非加算なので、このパスでは 3 回リロードが発火しない
 
 ### OAuth ポップアップ中のリロード抑止
 - ポップアップ表示中にリロードすると認証フローが壊れる
@@ -275,10 +265,10 @@ API レスポンスの `resets_at`（ISO 8601）を `Date.roundedToNearestHour()
 
 ## 即時 fetch（起動直後・ログイン後）
 
-`WebViewCoordinator.webView(_:didFinish:)` で設定 URL のページ読み込み完了を検出したら `AutomationManager.scheduleImmediateFetch()` を呼ぶ。
+`WebViewCoordinator.webView(_:didFinish:)` で claude.ai 到達（`AutomationManager.isClaudeAiPage`）を検出したら `AutomationManager.scheduleImmediateFetch()` を呼ぶ。
 
-- `DispatchWorkItem` で 5 秒後に `tick()` を実行（click → API レスポンス待機 → パース）
-- 既にスケジュール済みのものがあれば `cancel()` してから再設定
+- `DispatchWorkItem` で `postLoadDelaySeconds` 秒後に `tick()` を実行（tick → 2 段 fetch → パース）
+- 既にスケジュール済みのものがあれば `cancel()` してから再設定（ログイン直後の複数ナビゲーション等で didFinish が連発しても tick は 1 回に coalesce される）
 - タイマーループとは独立（タイマー間隔の途中でも実行される）
 
 これにより、以下のタイミングで即座にデータが更新される:
@@ -312,11 +302,11 @@ View 層から `.onChange` を消したため、ウィンドウが一度も開�
 
 ### 手動更新 (`runManualFetch`)
 
-MenuBarExtra の「手動更新」から呼ばれる公開 API。`cancelAllInFlightFetches()` で pending をクリアしたうえで、設定 URL を `webView.load(URLRequest(url:))` で再ロードする。ロード完了後の `didFinish` → `scheduleImmediateFetch()` → `tick()` の連鎖で使用量更新ボタンクリック → API レスポンス受信が走る。タイマーのリセットは `tick()` 冒頭で `start()` が呼ばれるため `runManualFetch` 側では行わない（冗長な二重リセット回避）。
+MenuBarExtra の「手動更新」から呼ばれる公開 API。`cancelAllInFlightFetches()` で pending をクリアしたうえで、設定 URL を about:blank を挟む 2 ステップナビゲーションでフルリロードする（「fetch レース回避」節参照）。ロード完了後の `didFinish` → `scheduleImmediateFetch()` → `tick()` の連鎖で 2 段 fetch → パースが走る。タイマーのリセットは `tick()` 冒頭で `start()` が呼ばれるため `runManualFetch` 側では行わない（冗長な二重リセット回避）。usage データ取得自体はページ再描画に依存しないが、リロードには「未ログイン時に `/login` へのリダイレクトをナビゲーションレベルで露見させる」副次効果があり、`.loginRequired`（fetch 応答からの陽性検出）と併存して働く。
 
 ### 起動シーケンス
 
-`AutomationManager.init` では初回 URL ロードを直接行わず、`DispatchQueue.main.asyncAfter(deadline: .now() + 5)` で `runManualFetch()` を 1 回だけ予約する。これにより初回ロードも「手動更新 → didFinish → scheduleImmediateFetch → tick」という通常フローに乗り、コードパスが一本化されて二重ロード・二重 `scheduleImmediateFetch` が発生しない。
+`AutomationManager.init` では初回 URL ロードを直接行わず、`DispatchQueue.main.asyncAfter(deadline: .now() + 5)` で `runManualFetch()` を 1 回だけ予約する。ログイン項目起動直後はネットワークが未確立のことがあり、初回ページロードの成功率を上げるための猶予として機能する。これにより初回ロードも「手動更新 → didFinish → scheduleImmediateFetch → tick」という通常フローに乗り、コードパスが一本化されて二重ロード・二重 `scheduleImmediateFetch` が発生しない。
 
 ---
 
@@ -349,12 +339,7 @@ MenuBarExtra の「手動更新」から呼ばれる公開 API。`cancelAllInFli
 
 ### LogView のレンダリング
 
-- 全エントリを `.map(\.formatted).joined(separator: "\n")` で 1 本の `String` にまとめ、単一の `Text` に渡す
-- `textSelection(.enabled)` で複数行選択・コピー可
-- `ScrollViewReader` と末尾マーカー（`Color.clear` に `id("log-bottom")` を付けた 1px View）を使い、`onChange(of: entries.count)` と `onAppear` で `proxy.scrollTo(..., anchor: .bottom)` を呼んで自動末尾追従
-- `withAnimation(.none)` でアニメーションを抑止（スクロール ジャンプを回避）
-- 空状態は「ログはまだありません」を中央表示
-- ヘッダに `N / 1000 行`、右端に「クリア」ボタン
+ログ本文は `LogTextView`（`NSViewRepresentable` で `NSTextView` をラップ）で描画する。SwiftUI `Text` + `.textSelection(.enabled)` を使わない理由は「過去にハマった問題 #14」参照（1000 行規模で CPU 100% になった実績があるため、この選択は意図的な制約であり Text へ戻すべきではない）。
 
 ### ログウィンドウの起動時挙動
 
@@ -387,14 +372,14 @@ tick 発火経路（自動 Timer / `scheduleImmediateFetch` / `runManualFetch` �
 
 ## fetch レース回避
 
-reload（手動更新 / セッションクリア / 3 連続失敗自動リロード / URL 設定変更）が走ったとき、in-flight の処理が新ページに引き継がれて誤動作する race を防ぐため、in-flight の WorkItem と pending slot を目的別にキャンセルする仕組みを持つ。
+reload（手動更新 / セッションクリア / 3 連続失敗自動リロード / URL 設定変更）が走ったとき、in-flight の処理が新ページに引き継がれて誤動作する race を防ぐため、in-flight の WorkItem と usage fetch を目的別にキャンセルする仕組みを持つ。
 
 ### 対象となる in-flight 状態
 
 | プロパティ | 発生タイミング |
 |---|---|
-| `immediateFetchWorkItem` | `didFinish` → `scheduleImmediateFetch()` で予約される「5 秒後に `tick()`」の `DispatchWorkItem` |
-| `pendingAPIHandler` + `pendingAPITimeoutWorkItem` | `tick()` 内でボタンクリック直前にセットされる API レスポンス待機スロット（= 使用量更新ボタン押下後に届く `/api/organizations/.../usage` レスポンスを拾うためのハンドラと 10 秒 timeout） |
+| `immediateFetchWorkItem` | `didFinish` → `scheduleImmediateFetch()` で予約される「postLoadDelaySeconds 秒後に `tick()`」の `DispatchWorkItem` |
+| `usageFetchGeneration` + `usageFetchWatchdogWorkItem` | `beginUsageFetch()` で発行する 2 段 fetch (organizations → usage) の世代番号と、その watchdog `DispatchWorkItem` |
 
 ### キャンセルヘルパの責務分離
 
@@ -402,45 +387,53 @@ reload（手動更新 / セッションクリア / 3 連続失敗自動リロー
 
 | ヘルパ | 役割 | 呼び出し元 |
 |---|---|---|
-| `cancelImmediateFetch()` | 5 秒後 tick 予約のみ破棄 | （内部用） |
-| `cancelPendingAPIWait()` | API 応答待機スロット（handler + timeout）を破棄 | `tick()` 冒頭、MessageHandler 内 |
-| `cancelAllInFlightFetches()` | 上の両方を一括破棄 | `runManualFetch()` / `clearSessionAndReload()` / `handleURLSettingChanged()` / 3 連続失敗リロード直前 |
+| `cancelImmediateFetch()` | postLoadDelaySeconds 秒後 tick 予約のみ破棄 | （内部用） |
+| `invalidateInFlightFetch()` | in-flight の usage fetch を無効化する（世代番号を進め、watchdog をキャンセル） | `beginUsageFetch()` 冒頭、completion / watchdog 反映前 |
+| `cancelAllInFlightFetches()` | 上の両方 + `pendingLoadURL` を一括破棄 | `runManualFetch()` / `clearSessionAndReload()` / `handleURLSettingChanged()` / 3 連続失敗リロード直前 |
 
-`tick()` 冒頭では `cancelPendingAPIWait()` のみを呼ぶ（次の tick が別のクリックを発火する前提なので immediate 予約は触らない）。
+### 世代番号方式
 
-### pending slot 方式
+「in-flight の usage fetch の結果を 1 tick あたり 1 回だけ反映し、reload/キャンセル後に届いた古い結果を無効化する」ため、`usageFetchGeneration`（Int）を使う:
 
-「いつ届くか分からない API レスポンスを tick サイクル内でだけ拾う」ため、以下の pending slot 方式を使う:
-
-- `pendingAPIHandler: ((Data) -> Void)?` … レスポンス本体を処理するクロージャ。`tick()` 開始時にセット、タイムアウト or handler 発火で nil へ戻す
-- `pendingAPITimeoutWorkItem: DispatchWorkItem?` … 10 秒後に `applyFailure(reason: .apiResponseTimeout)` を発火するフォールバック
-- MessageHandler は `pendingAPIHandler` がセット中のときだけ capture を採用し、それ以外は DEBUG ログだけ残して破棄する（tick 外で届いたレスポンスは `consecutiveFailureCount` に影響させない）
+- `beginUsageFetch()` が `invalidateInFlightFetch()` で世代を進めてから発行時点の世代を記録する
+- `callAsyncJavaScript` の completion と watchdog はどちらも、反映前に記録した世代と現在の `usageFetchGeneration` が一致するかを確認する。不一致なら何もせず破棄する
+- 先着した側（completion または watchdog）が `invalidateInFlightFetch()` を呼んで世代をさらに進めるため、後から届いた側は不一致になり反映されない
+- reload 系操作は `cancelAllInFlightFetches()` 経由で世代を進めるため、reload 前に発行された in-flight の fetch は完了しても状態に反映されない
 
 ---
 
-## API レスポンス傍受方式
+## API 直接呼び出し方式
 
-claude.ai 内部の `/api/organizations/[^/]+/usage` レスポンスを WebView 内で傍受してデータを取得する。DOM スクレイプは使わない。
+claude.ai の使用量 API を WebView 内の JS で直接呼び出してデータを取得する。DOM スクレイプは使わない。
 
-### 注入する JS ラッパ
+### usageFetchJS（2 段 fetch）
 
-`AutomationManager.interceptUsageJS` が `WKUserScript(injectionTime: .atDocumentStart, forMainFrameOnly: true)` として登録され、`window.fetch` と `window.XMLHttpRequest` をラップする。
+`AutomationManager.usageFetchJS` を `webView.callAsyncJavaScript` の async function body として実行する（`contentWorld: .defaultClient`）。
 
-- URL が `USAGE_RE = /\/api\/organizations\/[^/]+\/usage(\?|$)/` に一致したときだけ、`response.clone().text()` の結果を `window.webkit.messageHandlers.usageAPI.postMessage({ url, body, status })` で Swift に転送する
-- **観測専用（read-only tap）**: 元 response は `clone()` してから読むため page 側の DOM 更新・データフローには干渉しない
-- 例外は全て握りつぶす（ラッパが原因でページ挙動を壊さないことを最優先）
-- `WKUserContentController` に登録しているため全 navigation で自動再注入される（ページリロード時も気にしなくてよい）
-- OAuth ポップアップ側の WebView も `createWebViewWith` 経由で同じ `configuration` を継承するため、script handler が引き継がれる（副作用なし: OAuth ページは `/usage` を叩かない）
+- `orgUuid`（未解決時は空文字）/ `timeoutMs` / `previewLength` を `arguments` で注入する
+- `orgUuid` が空なら `GET /api/organizations` で org 一覧を取得し、先頭要素の `uuid` を採用する（org 選択ポリシーは JS 内 1 箇所に閉じ込め、複数 org 対応時はここを設定値参照に差し替える）
+- 続けて `GET /api/organizations/{uuid}/usage` を実行する
+- JS は **reject せず**、常に plist 互換の flat な辞書を resolve で返す（`{ ok, stage, kind, status, contentType, redirected, bodyHead, body, ... }`）。JS は「機構と生の事実」だけを返し、失敗の意味づけ（未ログイン判定・カウント加算）は Swift 側の `classifyAndApplyFetchFailure` に集約する
+- 各 fetch には `AbortSignal.timeout(timeoutMs)` を指定し、タイムアウト時は `kind: "timeout"` で resolve する
+- fetch はドキュメント相対パスで発行する（same-origin が自動成立し、ホスト名を JS 内へハードコードしない）
 
-### MessageHandler とプラン判定
+### 世代管理と watchdog
 
-`AutomationManager` が `WKScriptMessageHandler` に準拠し、`"usageAPI"` 名で受信する。受信した JSON を `classifyPlan(json:)` で分類:
+`beginUsageFetch()` が世代番号を進めてから fetch を発行し、`callAsyncJavaScript` の completion は main thread で世代一致を確認してから 1 回だけ結果を反映する（詳細は「fetch レース回避」節）。`fetchWatchdogSeconds`（`fetchTimeoutSeconds * 2 + 5` から導出）は completion が呼ばれないケース（WebContent プロセス不調等）に備えた Swift 側の最終上限で、発火時は世代を無効化してから `applyFailure(reason: .fetchTimeout)` する。
 
-- `five_hour == nil && seven_day == nil && extra_usage.is_enabled == true` → `.enterprise`
-- `five_hour != nil || seven_day != nil` → `.individual`
-- 両方 null かつ extra_usage 無効 → nil（`.unknownPlan` 失敗）
+### org uuid キャッシュ
 
-Individual で片側が null の場合（例: `seven_day` だけ null）は該当フィールドを null として出力し、失敗扱いにしない。`resets_at: null` も `utilization: 0.0` 時などに発生し得るため optional 扱い。
+`cachedOrgUuid` に解決済みの org uuid を保持し、以降の tick では organizations 段をスキップする。無効化するのは次の 3 箇所:
+
+1. `clearSessionAndReload()`（セッションが変われば org も変わり得るため。`removeData` 完了ハンドラ内でも再度破棄し、クリア中に走った tick による再キャッシュを防ぐ）
+2. `applyLoginRequired()`（再ログイン後は別アカウントの可能性があるため）
+3. usage fetch の HTTP 404（org 消滅・権限喪失。次 tick で再解決させる）
+
+### handleUsageFetchResult とプラン判定
+
+`beginUsageFetch()` の completion が受け取った辞書を `handleUsageFetchResult(_:)` が解釈する。`ok == true` かつ `contentType` が JSON なら usage の body（文字列）を `Data` 化して `handleUsageResponseBody(_:)` に渡し、`classifyPlan(json:)` で分類する。判定条件は「外部依存箇所」セクションのプラン判定を参照。
+
+Individual で片側が null の場合（例: `seven_day` だけ null）は該当フィールドを null として出力し、失敗扱いにしない。`resets_at: null` も `utilization: 0.0` 時などに発生し得るため optional 扱い。`ok == true` でも `contentType` が非 JSON（ログイン HTML へのリダイレクト等）なら未ログイン扱い（`applyLoginRequired()`）とする。
 
 ### buildUsagePayload
 
@@ -472,19 +465,7 @@ Individual で片側が null の場合（例: `seven_day` だけ null）は該�
 
 ## URL 未設定時の WebView リセット
 
-設定画面で URL を空文字に変更した場合、`handleURLSettingChanged()` は WebView に `about:blank` をロードする（`cancelAllInFlightFetches()` を先行実行）。これにより古い `/settings/usage` のページが残って後続の URL 変更後に誤って傍受結果を拾う事故を防ぐ。status は `.urlNotConfigured` に遷移。
-
----
-
-## API POST -1009 リトライ
-
-起動直後の数秒間は URLSession がネットワーク可用性を把握しきれず、実際はオンラインでも `NSURLErrorNotConnectedToInternet` (-1009) を返すことがある。`postToAPIIfNeeded` / `performPOST` は再帰方式で以下を行う:
-
-- 初回呼び出しは `allowRetry: true` で `performPOST` に委譲
-- `dataTask` completion で `NSURLErrorDomain` + `-1009` を検知し、`allowRetry == true` なら 2 秒後に `allowRetry: false` で再呼び出し
-- リトライ 1 回限り。2 回目も失敗 or 他のエラーコードは即 `.failed(.networkFailed)` で確定
-
-これにより「起動 5 秒後の初回 `runManualFetch` → API POST が -1009 で失敗」の偽陽性を抑制する。
+設定画面で URL を空文字に変更した場合、`handleURLSettingChanged()` は WebView に `about:blank` をロードする（`cancelAllInFlightFetches()` を先行実行）。`about:blank` は claude.ai origin ではないため、この間に tick が走っても `isClaudeAiPage` ガードで skip される。status は `.urlNotConfigured` に遷移。
 
 ---
 
@@ -494,7 +475,7 @@ Individual で片側が null の場合（例: `seven_day` だけ null）は該�
 
 ### 閾値と判定ロジック
 
-- 閾値は `AppSettings.warningThresholdPct`（Int、1〜100%、初期値 90%）。`UserDefaults` キー `warningThresholdPct` で永続化
+- 閾値は `AppSettings.warningThresholdPct`（1〜100% の範囲で `UserDefaults` に永続化。初期値は同プロパティの宣言を参照）
 - 判定は `AutomationManager.statusBarColor` computed プロパティで毎回行う（状態フラグを持たないため常に最新値を反映）
 - 比較は `>=`（閾値ちょうどで Orange）。session / weekly のどちらか片方でも越えれば Orange
 
@@ -546,11 +527,7 @@ Individual で片側が null の場合（例: `seven_day` だけ null）は該�
 
 ### レンダリング時の色処理
 
-`ClaudeUsageMonitorApp.statusBarIcon(color:)` が `StatusBarColor` を受け取って NSImage を返す:
-
-- `.green` → `NSImage(named: "StatusBarIcon")` を `copy()` してから `isTemplate = true`。macOS がメニューバーのアピアランスに合わせて自動で色（ダーク: 白基調、ライト: 黒基調）を付けるため、通常時はうるさくない見た目になる。コピーを返しているのは他の呼び出しパスで `isTemplate` を書き換えられるリスクを避けるため
-- `.orange` / `.red` → base の CGImage を取得し、`NSImage(size:flipped:)` の中で CGContext に `draw(baseCG, in: rect)` → `setBlendMode(.sourceIn)` → `setFillColor(systemOrange / systemRed)` → `fill(rect)` の順で描画。これでシルエットの形状を保ったまま中身だけを任意色に置換できる。仕上げに `isTemplate = false` を設定して macOS のテンプレート処理を切る
-- 素材が読み込めない場合のみ `fallbackDotIcon(color:)` で塗り丸（16x16、`insetBy(dx: 3, dy: 3)`、`systemGreen` / `systemOrange` / `systemRed`）に逃げる。存在チェックは `NSImage(named:)` の返り値 nil のみで判定
+`ClaudeUsageMonitorApp.statusBarIcon(color:)` が状態色に応じて NSImage を返す。green は `isTemplate = true` で macOS 標準のテンプレート処理（ダーク/ライトに応じた自動配色）に委ね、orange / red は CGContext の `.sourceIn` ブレンドでシルエット形状を保ったまま塗り色だけ差し替える（`isTemplate = false` で固定色化）。素材が読み込めない場合のみ塗り丸へフォールバックする。実装の詳細はソースコードのコメントを参照。
 
 ### SF Symbol を使わない理由
 
@@ -652,20 +629,22 @@ MenuBarExtra の label に SF Symbol を渡す方式では色を確実に反映�
 - **対応**: クリア手順を両方実行する。`defaults delete <bundle-id>` と `rm -rf ~/Library/Containers/<bundle-id>` の両方を揃えないと UserDefaults が完全にはリセットされない
 - 新しい永続化キーを追加したあとに挙動確認するときはこの手順で必ずクリーンな状態から検証する
 
+### 14. SwiftUI `Text` + `.textSelection` の大量テキストで CPU 100%
+- ログ全行を結合した巨大文字列を `Text` + `.textSelection(.enabled)` に渡す構成にすると、マウスホバー・スクロールのたびに全行ヒットテスト＋グリフジオメトリ計算が走り、1000 行規模で CPU 100% に張り付く
+- **対応**: `LogTextView`（`NSViewRepresentable` で `NSTextView` をラップ）に置き換える。`NSTextView` はネイティブのテキストエンジンを使うため大量テキストでも選択・スクロールが軽量
+- ログ表示に限らず、大量テキストを選択可能な形で表示する UI を今後追加する場合はこの地雷を踏まないよう `Text` + `.textSelection` を避ける
+
 ---
 
 ## ビルド・コード品質の取り決め
 
 ### コードスタイル
 - インデント: スペース 2 個（Xcode デフォルト）
-- `static let` キャッシュ: `DateFormatter`、`JSONEncoder`、`NSRegularExpression` など
+- `static let` キャッシュ: `DateFormatter`、`JSONEncoder`、`ISO8601DateFormatter` など、生成コストのあるオブジェクトは使い回す
 - `[weak self]`: クロージャで `self` を参照する場合、二重キャプチャはしない（内側のみで十分）
 - `@MainActor`: 必要最小限。UI View に関連する処理のみ。Combine 購読で `settings.$url` / `settings.$intervalSeconds` を sink する箇所は、SwiftUI の `@Published` が MainActor 上で発行する契約に依存しており、sink クロージャ内で UI / `@Published status` を更新しても MainActor 保証が成立する
 
-### セキュリティ
-- API POST に認証ヘッダーなし（将来的に API キー項目を設定に追加予定なら拡張可能）
-- `URLSession.shared` を使用（証明書ピンニングなし）
-- `monitoringFileName` はパストラバーサル対策で `lastPathComponent` のみ使用
+セキュリティ上の既知の非対応事項（認証ヘッダー・証明書ピンニング等）は「既知の制約」セクション参照。
 
 ---
 
@@ -678,7 +657,7 @@ MenuBarExtra の label に SF Symbol を渡す方式では色を確実に反映�
 
 ソースコードに直接書かれた開発用フラグ。本番配布前にデフォルト値（`.info` / `false`）に戻すこと。
 
-- `LogStore.minLevel: LogLevel`（`LogStore.swift`）— `.info` → `.debug` にするとタイマー発火・API 受信（URL / status / bytes）・JSON パース結果・プラン判定までログに残る。`usageAPI 受信 [pending|passive] status=... bytes=... url=...` が AJAX 傍受確認の一次情報
+- `LogStore.minLevel: LogLevel`（`LogStore.swift`）— `.info` → `.debug` にするとタイマー発火・usage fetch 開始・org uuid 解決・JSON パース結果・プラン判定までログに残る。`usage fetch 失敗詳細: stage=... kind=... status=... contentType=... redirected=... bodyHead=...` が fetch 失敗の切り分けの一次情報
 - `AutomationManager.enterpriseTestMode: Bool`（`AutomationManager.swift`）— 手元が Individual アカウントでも Enterprise UI / JSON 出力を検証するための一時フラグ。true にすると `extra_usage.is_enabled == true` のレスポンスを (`five_hour` / `seven_day` の有無に関係なく) Enterprise として分類する。動作中は DEBUG ログに `enterpriseTestMode=true: Individual データを Enterprise として強制分類` が出る。`extra_usage.is_enabled` は Pro/Max の設定画面でユーザーが切り替えられるオプションであることを前提にした判定ロジック
 
 ### Xcode での確認
@@ -687,17 +666,23 @@ MenuBarExtra の label に SF Symbol を渡す方式では色を確実に反映�
 ### 手動テスト
 - メニューの「手動更新」で任意タイミングで取得実行可能
 - 設定画面の「セッションをクリアして再読み込み」ボタンで任意タイミングでセッションリセットをテスト可能
-- URL を `https://claude.ai/settings/general` などに一時的に変えて URL 不一致時の `.notOnSettingsPage` 表示を確認可能（戻すのを忘れずに）
+- URL を `https://example.com` などクラウド外に一時的に変えて `.notOnClaudePage` 表示を確認可能（戻すのを忘れずに）
 - メニュー「ログ」でログウィンドウを開き、tick / Save / fetch 成否のイベントが記録されることを確認
 
 ### 主要テスト観点
 
-- ウィンドウを一度も開かずに起動したまま `intervalSeconds` だけ待ち、自動 tick で API レスポンス取得が成功する（アイコンが Green になる）ことを確認
+- ウィンドウを一度も開かずに起動したまま `intervalSeconds` だけ待ち、自動 tick で usage fetch が成功する（アイコンが Green になる。2 tick 目以降は `usage fetch 開始 (org=<uuid>)` の DEBUG ログで org uuid キャッシュが効いていることを確認できる）ことを確認
 - 「ウィンドウを表示」→ 閉じるボタンで非表示 → `intervalSeconds` 待ち → 依然として自動取得が走り成功することを確認（閉じるボタンは破棄ではなく不可視化）
 - ウィンドウをリサイズして閉じ、再度「ウィンドウを表示」で開き直したときにサイズが保持されている（位置は中央に再配置）ことを確認
+- 手動更新: about:blank → 設定 URL の 2 段ナビでフルリロードされ、didFinish → 即時 fetch で取得成功すること
+- セッションクリア → org uuid キャッシュ破棄（次回 fetch で `org uuid 解決` が再度出る）→ ログイン画面 → `.loginRequired` になることを確認
+- `.loginRequired` 中は `consecutiveFailureCount` が増えず自動リロードも走らないこと。ログイン完了後は didFinish → 自動復帰すること
 - 設定画面で URL / 間隔 / ファイル名等を変更したあと、Save を押下するまでモニタリング動作が変わらず、Save 後に即反映されることを確認
 - URL を空文字に変更して Save → WebView が `about:blank` に切り替わりアイコンが Red（URL 未設定）になることを確認
 - 設定で同じ interval 値を再 Save（変更なし Save）したとき、タイマーが再貼付されず Log に `intervalSeconds 変更を検知` が出ないことを確認（`.removeDuplicates()` の効き）
+- 3 連続失敗の自動リロード: ネットワーク切断等で `.fetchNetworkError` または `.fetchTimeout` が 3 回続きリロードが走ることを確認
+- reload 系操作（手動更新 / セッションクリア / URL 変更）直後に古い fetch 結果が反映されないこと（世代管理）を確認
+- OAuth ポップアップの生成・閉じ → settings.url ロード → 即時 fetch の連鎖を確認
 - Enterprise プラン相当のレスポンス検証には `enterpriseTestMode` フラグ（「開発用フラグ」セクション参照）を一時的に true にして確認
 
 ---
@@ -713,8 +698,8 @@ MenuBarExtra の label に SF Symbol を渡す方式では色を確実に反映�
 
 ### API レスポンス JSON キーの追加追跡
 - `AutomationManager.buildUsagePayload(from:)` を更新。`json["..."] as? [String: Any]` / `as? Double` など辞書アクセスで追加キーを参照する
-- 傍受対象 URL パターンを増やす場合は `interceptUsageJS` 内の `USAGE_RE` を更新
-- JS 側の fetch / XHR ラッパが URL マッチに失敗すると Swift 側に何も届かないため、変更後は実機で DEBUG ログ（`usageAPI: pending 外の capture を破棄` や `fetch 成功`）を確認する
+- `usageFetchJS` の呼び出し先パス（organizations / usage）を変更する場合は `AutomationManager.usageFetchJS` を直接更新する
+- 変更後は実機で DEBUG ログ（`usage fetch 開始` / `org uuid 解決` / `usage JSON パース成功 keys:` / `fetch 成功`）を確認する
 
 ### 設定項目追加
 1. `AppSettings` に `@Published` プロパティと `didSet` 追加
@@ -736,7 +721,7 @@ MenuBarExtra の label に SF Symbol を渡す方式では色を確実に反映�
 3. 判定ロジック追加:
    - 新しい Red 状態 → 専用の `applyXxx()` メソッドを追加し、`consecutiveFailureCount` に加算するかどうかを明示
    - 新しい失敗原因 → `applyFailure(reason: .xxx)` を呼ぶ箇所を追加
-4. 「`consecutiveFailureCount` に加算するか」「3 回連続失敗リロードの対象にするか」を設計時に必ず決める（`.notOnSettingsPage` / `.urlNotConfigured` パターンは非加算）
+4. 「`consecutiveFailureCount` に加算するか」「3 回連続失敗リロードの対象にするか」を設計時に必ず決める（`.notOnClaudePage` / `.urlNotConfigured` / `.loginRequired` パターンは非加算）
 5. 必要に応じて本ドキュメントの「状態遷移ルール」テーブルを更新
 
 ---
@@ -767,6 +752,6 @@ rm -rf /tmp/ClaudeUsageMonitor_build
 - `URLSession.shared` 使用のため、証明書ピンニングなし（MITM 耐性なし）
 - API POST に認証ヘッダー未対応（送信先は信頼できる環境に限定する想定）
 - WKWebView プロセスのサンドボックス由来の警告ログ（`CFPasteboard`, `launchservicesd`, `networkd` 等）が多数出るが無害
-- claude.ai の API / URL パターンに依存しているため、サイト側の変更で動作しなくなる可能性あり
+- claude.ai の API パスとレスポンス JSON 構造に依存しているため、サイト側の変更で動作しなくなる可能性あり（DOM 要素には非依存）
 - ユーザー通知の許可設定はアプリ内トグルではなく「システム設定 → 通知 → ClaudeUsageMonitor」で管理する方針。初回起動時のみ `UNUserNotificationCenter.requestAuthorization` でダイアログが出る。拒否されても monitoring は継続する（通知のみサイレント無視）
 - ログイン時起動は `SMAppService.mainApp` 経由で macOS 13+ のログイン項目 API を使用する。現在は Ad-hoc 署名のみで配布しているため、初回 `register()` で macOS のシステム承認を要求されるケースがある。Developer ID 署名 + 公証が整うまでは回避手段がない

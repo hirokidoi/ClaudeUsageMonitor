@@ -21,6 +21,8 @@ class AppSettings: ObservableObject {
     static let warningThresholdPct = "warningThresholdPct"
   }
 
+  // 表示・ログイン用ページ URL (初回ロード / 手動更新 / 自動リロード / OAuth 復帰先)。
+  // usage データ取得はページに依存しないため、claude.ai 配下であれば任意のページでよい
   @Published var url: String = AppSettings.defaultUrl {
     didSet { UserDefaults.standard.set(url, forKey: Keys.url) }
   }
@@ -55,11 +57,5 @@ class AppSettings: ObservableObject {
     if defaults.object(forKey: Keys.warningThresholdPct) != nil {
       warningThresholdPct = defaults.integer(forKey: Keys.warningThresholdPct)
     }
-  }
-
-  func matches(url other: URL?) -> Bool {
-    // 設定 URL 未設定時は常に不一致扱い (呼び出し側の isEmpty ガード不要化)
-    guard !url.isEmpty, let other, let settingsURL = URL(string: url) else { return false }
-    return other.host == settingsURL.host && other.path == settingsURL.path
   }
 }
