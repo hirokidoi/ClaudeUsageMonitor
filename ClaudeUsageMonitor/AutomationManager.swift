@@ -16,7 +16,7 @@ class AutomationManager: NSObject, ObservableObject {
   private var timer: Timer?
   private var consecutiveFailureCount = 0
   private var immediateFetchWorkItem: DispatchWorkItem?
-  // tick 発火で「使用制限を更新」ボタンをクリックした後に届く API レスポンスを受け取るためのスロット。
+  // tick 発火で使用量更新ボタンをクリックした後に届く API レスポンスを受け取るためのスロット。
   // pendingAPIHandler がセット中のときだけ `/api/organizations/.../usage` の capture を採用し、
   // timeout が来たら applyAPIResponseTimeout に流す
   private var pendingAPIHandler: ((Data) -> Void)?
@@ -45,9 +45,12 @@ class AutomationManager: NSObject, ObservableObject {
     return c
   }()
 
-  // tick で「使用制限を更新」ボタンクリック後、/api/organizations/.../usage レスポンスが
+  // tick で使用量更新ボタンクリック後、/api/organizations/.../usage レスポンスが
   // 届くまで待つ上限。ネットワーク RTT + サーバ処理分を見込む
   private static let apiResponseTimeoutSeconds: TimeInterval = 10
+
+  // claude.ai の使用量更新ボタンのセレクタ (aria-label 依存)。サイト側のラベル変更時はここを直す
+  private static let refreshButtonSelector = #"button[aria-label="更新"]"#
 
   // Enterprise プラン UI / JSON 出力を手元アカウントで検証するための開発フラグ。
   // true の間は extra_usage.is_enabled == true のレスポンスを (five_hour/seven_day の有無に関係なく)
@@ -243,7 +246,7 @@ class AutomationManager: NSObject, ObservableObject {
     webView.load(URLRequest(url: URL(string: "about:blank")!))
   }
 
-  // 「使用制限を更新」ボタン押下後の API レスポンスを待つスロットを破棄する。
+  // 使用量更新ボタン押下後の API レスポンスを待つスロットを破棄する。
   // timeout と handler の両方をクリアするため tick 冒頭や reload 経路で必ず呼ぶ
   private func cancelPendingAPIWait() {
     pendingAPITimeoutWorkItem?.cancel()
@@ -267,7 +270,7 @@ class AutomationManager: NSObject, ObservableObject {
 
   func scheduleImmediateFetch() {
     // didFinish 経由で呼ばれる。ページ描画が落ち着くのを postLoadDelaySeconds 待ってから
-    // tick を発火し、「使用制限を更新」ボタン押下 → API レスポンス待機の流れに乗せる
+    // tick を発火し、使用量更新ボタン押下 → API レスポンス待機の流れに乗せる
     immediateFetchWorkItem?.cancel()
     appLogDebug("\(Int(Self.postLoadDelaySeconds)) 秒後に tick をスケジュール")
     let item = DispatchWorkItem { [weak self] in self?.tick() }
@@ -394,14 +397,31 @@ class AutomationManager: NSObject, ObservableObject {
     DispatchQueue.main.asyncAfter(deadline: .now() + Self.apiResponseTimeoutSeconds, execute: timeoutItem)
     appLogDebug("API 応答待機スロット準備完了 (timeout=\(Int(Self.apiResponseTimeoutSeconds))s)")
 
-    let clickJS = #"document.querySelector('button[aria-label="使用制限を更新"]')?.click();"#
-    appLogDebug("「使用制限を更新」ボタン押下")
-    webView.evaluateJavaScript(clickJS) { [weak self] _, error in
+    // ボタン未検出時は false を返し、API レスポンスタイムアウトを待たず即失敗させる
+    let clickJS = """
+    (function() {
+      const btn = document.querySelector('\(Self.refreshButtonSelector)');
+      if (!btn) { return false; }
+      btn.click();
+      return true;
+    })();
+    """
+    appLogDebug("使用量更新ボタン押下")
+    webView.evaluateJavaScript(clickJS) { [weak self] result, error in
       guard let self else { return }
+      // pending スロット解決済み (capture 先着 / timeout 先行 / tick キャンセル) 後に届いた
+      // コールバックからは成否を反映しない (1 tick あたり成否反映 1 回の不変条件を守る)
+      guard self.pendingAPIHandler != nil else { return }
       if let error {
         self.appLogWarn("JS 評価エラー: \(error)")
         self.cancelPendingAPIWait()
         self.applyFailure(reason: .javaScriptError)
+        return
+      }
+      if (result as? Bool) != true {
+        self.appLogWarn("使用量更新ボタンが見つかりません: \(Self.refreshButtonSelector)")
+        self.cancelPendingAPIWait()
+        self.applyFailure(reason: .buttonNotFound)
       }
     }
   }
@@ -939,7 +959,8 @@ enum FailureReason {
   // URL 不一致は consecutiveFailureCount を加算しない専用パス (applyNotOnSettingsPage) を
   // 使うため、FailureReason 側の .notOnSettingsPage は廃止。URL 不一致状態の表現は
   // RedReason.notOnSettingsPage 側のみで行う
-  case javaScriptError           // 「使用制限を更新」ボタンクリック JS 失敗
+  case javaScriptError           // 使用量更新ボタンクリック JS 失敗
+  case buttonNotFound            // 使用量更新ボタン (refreshButtonSelector) が DOM に見つからない
   case jsonParseError            // API レスポンス JSON のパース失敗
   case jsonEncodeError
   case fileWriteFailed

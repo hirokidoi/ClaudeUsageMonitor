@@ -2,7 +2,7 @@
 
 今後の追加開発・保守で読んでおくべき事項を網羅的に記録。
 
-最終更新: 2026-04-19 JST
+最終更新: 2026-07-03 JST
 
 ---
 
@@ -102,7 +102,8 @@ OAuth ポップアップ（navigationDelegate 経由で生成される別ウィ�
 ### `FailureReason`
 tick サイクルの各失敗原因を enum で表現する。`.recentFailure` の `lastReason` に埋め込まれる。
 
-- `.javaScriptError` — 「使用制限を更新」ボタンクリック JS の実行失敗
+- `.javaScriptError` — 使用量更新ボタンクリック JS の実行失敗
+- `.buttonNotFound` — 使用量更新ボタン（`refreshButtonSelector`）が DOM に見つからない（claude.ai 側の aria-label 変更・ページ未描画など）。API レスポンスタイムアウトを待たず即失敗する
 - `.jsonParseError` — 捕捉した API レスポンス本体の JSON パース失敗
 - `.jsonEncodeError` — `UsageData` エンコード失敗
 - `.fileWriteFailed` — ファイル書き込み失敗
@@ -131,6 +132,7 @@ tick サイクルの各失敗原因を enum で表現する。`.recentFailure` �
 | `applyCombinedOutcome` が success 判定、session% または weekly% ≥ 閾値 | `.green(lastSuccessAt: Date())` | `.orange`（前回 `.orange` 以外なら通知 1 回発火） | 0 にリセット |
 | `applyCombinedOutcome` が failed 判定 | `.red(.recentFailure(count, lastReason))` | `.red` | +1。3 以上で自動リロード |
 | `.skipped` のみ | `applyCombinedOutcome` 内で success 扱い | 使用率による | 0 にリセット |
+| クリック JS で使用量更新ボタンが見つからない | `.red(.recentFailure(count, .buttonNotFound))` | `.red` | +1。3 以上で自動リロード |
 | ボタンクリック後 10 秒で API レスポンスなし | `.red(.recentFailure(count, .apiResponseTimeout))` | `.red` | +1。3 以上で自動リロード |
 | 届いた API JSON がプラン判定不能 | `.red(.recentFailure(count, .unknownPlan))` | `.red` | +1。3 以上で自動リロード |
 
@@ -188,8 +190,8 @@ tick サイクルの各失敗原因を enum で表現する。`.recentFailure` �
   - `five_hour == nil && seven_day == nil && extra_usage.is_enabled == true` → `.enterprise`
   - それ以外 → nil（`.unknownPlan` 失敗）
 
-### 更新ボタン
-- `button[aria-label="使用制限を更新"]` … `tick()` で click（ページ側が `/usage` API を叩く契機）
+### 使用量更新ボタン
+- `button[aria-label="更新"]`（`AutomationManager.refreshButtonSelector` に一元化）… `tick()` で click（ページ側が `/usage` API を叩く契機）。ボタンが見つからない場合はクリック JS が false を返し `.buttonNotFound` で即失敗する
 
 ### ナビゲーションループ検出対象 URL（`WebViewCoordinator.decidePolicyFor`）
 - URL 文字列に `/login` または `/logout` を含むもの
@@ -239,10 +241,11 @@ API レスポンスの `resets_at`（ISO 8601）を `Date.roundedToNearestHour()
 
 1. **URL 不一致**（`tick()` 先頭）: `settings.matches(url: webView.url)` で現在 URL のホスト+パスが設定 URL と一致するか確認。不一致なら `applyNotOnSettingsPage()` に流す。**`consecutiveFailureCount` には加算せず**、3 回連続失敗リロードの対象外。
 2. **JS 実行失敗**（click JS の `evaluateJavaScript` コールバック）: `applyFailure(reason: .javaScriptError)`。
-3. **API レスポンス タイムアウト**（10 秒）: `applyFailure(reason: .apiResponseTimeout)`。ボタンクリック後に `/api/organizations/.../usage` が捕捉できなかった場合（未ログイン・別ページ遷移・サーバ遅延など）。
-4. **JSON パース失敗**（`handleCapturedAPIResponse`）: `applyFailure(reason: .jsonParseError)`。
-5. **プラン判定不能**: `applyFailure(reason: .unknownPlan)`。
-6. **JSON エンコード失敗**・**ファイル書き込み失敗**・**HTTP 非 200**・**通信エラー**も `applyFailure(reason:)` を呼ぶ。
+3. **ボタン未検出**（click JS が false を返す）: `applyFailure(reason: .buttonNotFound)`。API レスポンスタイムアウトを待たず即失敗する（claude.ai 側の aria-label 変更やページ未描画の検知用）。
+4. **API レスポンス タイムアウト**（10 秒）: `applyFailure(reason: .apiResponseTimeout)`。ボタンクリック後に `/api/organizations/.../usage` が捕捉できなかった場合（未ログイン・別ページ遷移・サーバ遅延など）。
+5. **JSON パース失敗**（`handleCapturedAPIResponse`）: `applyFailure(reason: .jsonParseError)`。
+6. **プラン判定不能**: `applyFailure(reason: .unknownPlan)`。
+7. **JSON エンコード失敗**・**ファイル書き込み失敗**・**HTTP 非 200**・**通信エラー**も `applyFailure(reason:)` を呼ぶ。
 
 ### write と POST の独立実行
 
@@ -309,7 +312,7 @@ View 層から `.onChange` を消したため、ウィンドウが一度も開�
 
 ### 手動更新 (`runManualFetch`)
 
-MenuBarExtra の「手動更新」から呼ばれる公開 API。`cancelAllInFlightFetches()` で pending をクリアしたうえで、設定 URL を `webView.load(URLRequest(url:))` で再ロードする。ロード完了後の `didFinish` → `scheduleImmediateFetch()` → `tick()` の連鎖で「使用制限を更新」ボタンクリック → API レスポンス受信が走る。タイマーのリセットは `tick()` 冒頭で `start()` が呼ばれるため `runManualFetch` 側では行わない（冗長な二重リセット回避）。
+MenuBarExtra の「手動更新」から呼ばれる公開 API。`cancelAllInFlightFetches()` で pending をクリアしたうえで、設定 URL を `webView.load(URLRequest(url:))` で再ロードする。ロード完了後の `didFinish` → `scheduleImmediateFetch()` → `tick()` の連鎖で使用量更新ボタンクリック → API レスポンス受信が走る。タイマーのリセットは `tick()` 冒頭で `start()` が呼ばれるため `runManualFetch` 側では行わない（冗長な二重リセット回避）。
 
 ### 起動シーケンス
 
@@ -391,7 +394,7 @@ reload（手動更新 / セッションクリア / 3 連続失敗自動リロー
 | プロパティ | 発生タイミング |
 |---|---|
 | `immediateFetchWorkItem` | `didFinish` → `scheduleImmediateFetch()` で予約される「5 秒後に `tick()`」の `DispatchWorkItem` |
-| `pendingAPIHandler` + `pendingAPITimeoutWorkItem` | `tick()` 内でボタンクリック直前にセットされる API レスポンス待機スロット（= 「使用制限を更新」押下後に届く `/api/organizations/.../usage` レスポンスを拾うためのハンドラと 10 秒 timeout） |
+| `pendingAPIHandler` + `pendingAPITimeoutWorkItem` | `tick()` 内でボタンクリック直前にセットされる API レスポンス待機スロット（= 使用量更新ボタン押下後に届く `/api/organizations/.../usage` レスポンスを拾うためのハンドラと 10 秒 timeout） |
 
 ### キャンセルヘルパの責務分離
 
