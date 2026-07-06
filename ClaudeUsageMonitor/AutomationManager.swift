@@ -39,7 +39,7 @@ class AutomationManager: NSObject, ObservableObject {
   // JSON 出力・表示は端末 TZ に依存せず常に JST で統一する
   static let jst: TimeZone = TimeZone(identifier: "Asia/Tokyo")!
 
-  // JST 固定の Calendar。Date extension の roundedToNearestHour() や nextMonthFirstAtJST で共有する
+  // JST 固定の Calendar。Date extension の roundedToNearestTenMinutes() や nextMonthFirstAtJST で共有する
   // (端末 TZ に依存せず常に JST 視点で時刻を分解・再構築するため)
   static let jstCalendar: Calendar = {
     var c = Calendar(identifier: .gregorian)
@@ -550,8 +550,8 @@ class AutomationManager: NSObject, ObservableObject {
       let sessionPct: Int? = Self.asDouble(fh?["utilization"]).map { Int(round($0)) }
       let weeklyPct: Int? = Self.asDouble(sd?["utilization"]).map { Int(round($0)) }
       // utilization: 0.0 時などで resets_at: null が返るケースは正常扱い
-      let sessionResetDate = (fh?["resets_at"] as? String).flatMap { Self.parseISO8601($0) }?.roundedToNearestHour()
-      let weeklyResetDate  = (sd?["resets_at"] as? String).flatMap { Self.parseISO8601($0) }?.roundedToNearestHour()
+      let sessionResetDate = (fh?["resets_at"] as? String).flatMap { Self.parseISO8601($0) }?.roundedToNearestTenMinutes()
+      let weeklyResetDate  = (sd?["resets_at"] as? String).flatMap { Self.parseISO8601($0) }?.roundedToNearestTenMinutes()
 
       let data = UsageData(
         datetime: Self.dateFormatter.string(from: now),
@@ -1134,19 +1134,19 @@ extension AutomationManager {
 }
 
 // MARK: - Date extension
-// リセット時刻の時間単位四捨五入（3:30-4:29 → 4:00）。
+// リセット時刻の 10 分単位四捨五入（15:55-16:04 → 16:00）。
+// 「+5 分してから 10 分単位で切り捨て」で最も近い 10 分境界に丸める。
 // JSON 出力/API/表示が全て JST 固定である以上、分解-再構築も端末 TZ ではなく
 // AutomationManager.jstCalendar (JST) を基準に行い、UTC 端末などでも挙動を揃える
 extension Date {
-  func roundedToNearestHour() -> Date {
+  func roundedToNearestTenMinutes() -> Date {
     let calendar = AutomationManager.jstCalendar
-    let minute = calendar.component(.minute, from: self)
-    var components = calendar.dateComponents([.year, .month, .day, .hour], from: self)
-    components.minute = 0
+    guard let shifted = calendar.date(byAdding: .minute, value: 5, to: self) else { return self }
+    var components = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: shifted)
+    let minute = components.minute ?? 0
+    components.minute = (minute / 10) * 10
     components.second = 0
-    guard let hourStart = calendar.date(from: components) else { return self }
-    guard let nextHour = calendar.date(byAdding: .hour, value: 1, to: hourStart) else { return hourStart }
-    return minute >= 30 ? nextHour : hourStart
+    return calendar.date(from: components) ?? self
   }
 }
 

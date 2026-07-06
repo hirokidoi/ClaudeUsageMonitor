@@ -199,11 +199,11 @@ tick サイクルの各失敗原因を enum で表現する。`.recentFailure` �
 
 ## リセット時刻の丸め
 
-API レスポンスの `resets_at`（ISO 8601）を `Date.roundedToNearestHour()` で時間単位に四捨五入する:
+API レスポンスの `resets_at`（ISO 8601）を `Date.roundedToNearestTenMinutes()` で 10 分単位に四捨五入する:
 
-- 分 `0〜29` → 切り捨て、`30〜59` → 切り上げ
+- `+5 分` してから 10 分単位で切り捨て（分の 1 桁目を 0 に）することで、最も近い 10 分境界に丸める
 - 秒は常に無視
-- 例: `3:29` → `3:00`、`3:30` → `4:00`、`4:29` → `4:00`
+- 例: `15:54` → `15:50`、`15:55` → `16:00`、`15:59` → `16:00`、`16:04` → `16:00`、`16:05` → `16:10`
 
 丸めは `AutomationManager.jstCalendar`（JST 固定）で分解・再構築するため、端末 TZ が非 JST でも JST 視点で正しく丸まる。
 
@@ -439,7 +439,7 @@ Individual で片側が null の場合（例: `seven_day` だけ null）は該�
 
 `classifyPlan` の結果をもとに `UsageData`（JSON 出力）と `UsageSnapshot`（UI 用）を同時に構築する。
 
-- Individual: `five_hour.utilization` → `sessionPct`、`seven_day.utilization` → `weeklyPct`、両方の `resets_at` を `parseISO8601` → `roundedToNearestHour()`
+- Individual: `five_hour.utilization` → `sessionPct`、`seven_day.utilization` → `weeklyPct`、両方の `resets_at` を `parseISO8601` → `roundedToNearestTenMinutes()`
 - Enterprise: `extra_usage.utilization` → `sessionPct`、`session_reset_at` は JST の来月 1 日 0:00（`nextMonthFirstAtJST`）、`weeklyPct` / `weeklyResetAt` は nil
 
 ### 出力 JSON フォーマット

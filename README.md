@@ -155,7 +155,7 @@ Orange へ遷移した瞬間に macOS のユーザー通知（`Claude Usage Warn
 }
 ```
 
-キーはアルファベット順でソート済み。全時刻は JST（Asia/Tokyo）固定。`datetime` は計測時刻、`*_pct` は使用率（整数%）、`*_reset_at` はリセット時刻（時間単位に四捨五入）。
+キーはアルファベット順でソート済み。全時刻は JST（Asia/Tokyo）固定。`datetime` は計測時刻、`*_pct` は使用率（整数%）、`*_reset_at` はリセット時刻（10 分単位に四捨五入）。
 
 ### `plan` フィールド
 
