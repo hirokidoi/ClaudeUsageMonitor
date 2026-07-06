@@ -1139,12 +1139,15 @@ extension AutomationManager {
 // JSON 出力/API/表示が全て JST 固定である以上、分解-再構築も端末 TZ ではなく
 // AutomationManager.jstCalendar (JST) を基準に行い、UTC 端末などでも挙動を揃える
 extension Date {
+  private static let roundingStepMinutes = 10
+
   func roundedToNearestTenMinutes() -> Date {
+    let step = Self.roundingStepMinutes
     let calendar = AutomationManager.jstCalendar
-    guard let shifted = calendar.date(byAdding: .minute, value: 5, to: self) else { return self }
+    guard let shifted = calendar.date(byAdding: .minute, value: step / 2, to: self) else { return self }
     var components = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: shifted)
     let minute = components.minute ?? 0
-    components.minute = (minute / 10) * 10
+    components.minute = (minute / step) * step
     components.second = 0
     return calendar.date(from: components) ?? self
   }
