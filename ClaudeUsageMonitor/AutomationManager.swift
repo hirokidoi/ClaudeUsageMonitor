@@ -571,12 +571,9 @@ class AutomationManager: NSObject, ObservableObject {
       return (data, snapshot)
 
     case .enterprise:
-      guard
-        let extra = json["extra_usage"] as? [String: Any],
-        let util = Self.asDouble(extra["utilization"])
-      else { return nil }
-
-      let sessionPct = Int(round(util))
+      // utilization: null が返るケースは正常扱い
+      let extra = json["extra_usage"] as? [String: Any]
+      let sessionPct: Int? = Self.asDouble(extra?["utilization"]).map { Int(round($0)) }
       let sessionResetDate = Self.nextMonthFirstAtJST(from: now)
 
       let data = UsageData(
@@ -645,7 +642,7 @@ class AutomationManager: NSObject, ObservableObject {
     appLogDebug("usage JSON パース成功 keys: \(keySummary)")
 
     guard let (usage, snapshot) = buildUsagePayload(from: json) else {
-      appLogDebug("buildUsagePayload 失敗 (classifyPlan=nil または utilization 欠落)")
+      appLogDebug("buildUsagePayload 失敗 (classifyPlan=nil)")
       applyFailure(reason: .unknownPlan)
       return
     }

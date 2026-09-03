@@ -183,7 +183,7 @@ tick サイクルの各失敗原因を enum で表現する。`.recentFailure` �
     - `resets_at: String`（ISO 8601）
   - `extra_usage`（Enterprise 判定用）
     - `is_enabled: Bool`
-    - `utilization: Double`（Enterprise の月次使用率に使う）
+    - `utilization: Double`（Enterprise の月次使用率に使う。null の場合あり）
 - プラン判定（`classifyPlan`）:
   - `five_hour != nil || seven_day != nil` → `.individual`（片側 null は null フィールドで表現）
   - `five_hour == nil && seven_day == nil && extra_usage.is_enabled == true` → `.enterprise`
@@ -440,7 +440,7 @@ Individual で片側が null の場合（例: `seven_day` だけ null）は該�
 `classifyPlan` の結果をもとに `UsageData`（JSON 出力）と `UsageSnapshot`（UI 用）を同時に構築する。
 
 - Individual: `five_hour.utilization` → `sessionPct`、`seven_day.utilization` → `weeklyPct`、両方の `resets_at` を `parseISO8601` → `roundedToNearestTenMinutes()`
-- Enterprise: `extra_usage.utilization` → `sessionPct`、`session_reset_at` は JST の来月 1 日 0:00（`nextMonthFirstAtJST`）、`weeklyPct` / `weeklyResetAt` は nil
+- Enterprise: `extra_usage.utilization` → `sessionPct`（欠落・null なら nil として出力し、失敗扱いにしない）、`session_reset_at` は JST の来月 1 日 0:00（`nextMonthFirstAtJST`）、`weeklyPct` / `weeklyResetAt` は nil
 
 ### 出力 JSON フォーマット
 
