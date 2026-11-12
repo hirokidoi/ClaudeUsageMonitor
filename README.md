@@ -1,8 +1,17 @@
 # ClaudeUsageMonitor
 
-Claude のセッション使用率・週次/月次使用率・リセット時刻を表示、JSON として出力、外部 API に送信できる macOS メニューバー常駐アプリ。Individual（Pro / Max）、Enterprise の各プランに対応。
+Claude のセッション使用率（5時間）・週次/月次使用率・リセット時刻を表示、JSON として出力、外部 API に送信できる macOS メニューバー常駐アプリ。
+Individual（Pro / Max）、Enterprise の各プランに対応。
 
-![メニューバーのスクリーンショット](docs/screenshot001.jpg)
+通常 Claude Code CLI はセッション使用率などのメタ情報を直接参照することはできない。
+そこで、このアプリが出力する JSON を参照させることで、例えば、
+
+ - 現在のセッション使用率が 90% を超えたら作業を停止して。
+ - 5時間制限が次回リセットされるまでスリープして、リセット後に作業を開始して。
+
+のようなプロンプトが利用できるようになる。
+
+![メニューバーのスクリーンショット](imgs/screenshot001.jpg)
 
 ## 主要機能
 
@@ -15,7 +24,7 @@ Claude のセッション使用率・週次/月次使用率・リセット時刻
 ### モニタリング
 
 - 設定した間隔で claude.ai の使用量 API から直接セッション使用率・週次/月次使用率・リセット時刻を取得
-- （optional）取得データを JSON として `$TMPDIR` に保存
+- （optional）取得データを JSON として任意のフォルダに保存
 - （optional）取得データを設定した API エンドポイントに POST
 
 ### 使用率警告
@@ -24,17 +33,21 @@ Claude のセッション使用率・週次/月次使用率・リセット時刻
 - Orange への遷移時に macOS のユーザー通知が発火
 - 通知の ON / OFF は macOS の「システム設定 → 通知 → ClaudeUsageMonitor」から操作
 
-## 動作要件
+## 動作環境
 
 - macOS 15 以降
-- 依存ライブラリなし（標準フレームワークのみで動作）
+- ビルドおよびインストールには [Xcode](https://apps.apple.com/jp/app/xcode/id497799835?mt=12)（Command Line Tools のみでは不可）が必要
 
-## ビルド方法
+## セットアップ
 
-1. このリポジトリを clone する
-2. `ClaudeUsageMonitor.xcodeproj` を Xcode で開く
-3. Signing & Capabilities タブで自分の Team を選択
-4. Run ボタン（Cmd+R）でビルド・起動
+### 1. アプリ本体のインストール
+
+- このリポジトリを `git clone` するか、[ZIP でダウンロード](https://github.com/hirokidoi/ClaudeUsageMonitor/archive/refs/heads/master.zip) して展開する。
+
+- プロジェクトのルートディレクトリで以下のコマンドを実行するとビルドされ、`/Applications/ClaudeUsageMonitor.app` にアプリがインストールされる。
+  ```
+  make install
+  ```
 
 ## 使い方
 
@@ -81,8 +94,9 @@ Claude のセッション使用率・週次/月次使用率・リセット時刻
 
 メニューバーアイコンは Normal / Orange / Red の 3 値
 
-### Normal 条件（両方を満たす場合のみ）
+### Normal 条件（いずれか）
 - 使用量の取得が成功しており、セッション使用率・週次/月次使用率のいずれも警告閾値未満
+- 起動直後で一度も取得を終えていない（状態ラベルは `取得待機中`）
 
 Normal 時のアイコンは macOS のメニューバー色に自動追従する。
 
@@ -95,11 +109,13 @@ Orange へ遷移した瞬間に macOS のユーザー通知（`Claude Usage Warn
 
 | 状態 | 文言 |
 |------|------|
-| 起動直後で一度も成功していない | `取得待機中` |
 | URL 未設定 | `異常 - URL 未設定` |
 | claude.ai 以外のページを表示中 | `異常 - ページを確認してください` |
+| ページの読み込みに失敗 | `異常 - ページ読込失敗` |
 | 未ログイン | `異常 - 未ログイン (ウィンドウを表示してログイン)` |
 | 直近の取得が失敗 | `異常 - 取得失敗 (n/3)` |
+| JSON ファイルの書き込みに失敗 | `異常 - 出力失敗 (JSON)` |
+| API エンドポイントへの POST に失敗 | `異常 - 出力失敗 (API)` |
 | 成功時 | `正常 - 最終取得 HH:mm:ss` |
 
 ## ログ機能
@@ -123,7 +139,7 @@ Orange へ遷移した瞬間に macOS のユーザー通知（`Claude Usage Warn
 ### ログレベル
 
 `DEBUG` / `INFO` / `WARN` / `ERROR` の 4 段階。最大 1000 行の FIFO バッファで、古いものから破棄される。
-内部イベント（タイマー発火・ウィンドウ show/hide・細かいフィールド差分など）を追う必要がある場合の切り替え手順は [DEVELOPMENT.md](docs/DEVELOPMENT.md) を参照。
+内部イベント（タイマー発火・ウィンドウ show/hide・細かいフィールド差分など）を追う必要がある場合の切り替え手順は [DEVELOPMENT.md](DEVELOPMENT.md) を参照。
 
 ## 設定項目
 
@@ -134,7 +150,8 @@ Orange へ遷移した瞬間に macOS のユーザー通知（`Claude Usage Warn
 | URL | 内部ブラウザに表示する claude.ai の「使用量」ページ URL（ログイン・自動リロード先）|
 | 実行間隔 | 秒単位（10〜86400 秒、10 秒刻み、初期値 300 秒） |
 | APIエンドポイントURL | JSON を POST する先の URL（空にすると POST 無効） |
-| モニタリング用JSONファイル名 | `$TMPDIR` に保存するファイル名（空にすると保存無効） |
+| モニタリング用JSON保存先 | `$TMPDIR`（初期値）または任意のフォルダ。任意のフォルダは「選択…」ボタンから Finder で選ぶ（未選択の間は Save できない） |
+| モニタリング用JSONファイル名 | 保存先に書き出すファイル名（空にすると保存無効） |
 | 警告閾値 | セッション / 週次・月次使用率がこの値以上でアイコンが Orange になる（1〜100%、1% 刻み、初期値 90%） |
 
 - **「ログイン時に起動する」/「ログイン時の起動を無効にする」ボタン**: macOS のログイン項目に登録/解除する。操作は即時反映で Save 不要。現在の登録状態によってラベルが切り替わる。初回登録時は macOS のシステム設定で承認を促されることがある。ON/OFF 状態は「システム設定 → 一般 → ログイン項目」でも管理可能
@@ -142,20 +159,20 @@ Orange へ遷移した瞬間に macOS のユーザー通知（`Claude Usage Warn
 
 ## 出力形式
 
-`$TMPDIR/<設定ファイル名>` および API エンドポイントへの POST ボディに以下の形式の JSON を出力。
+`<保存先>/<設定ファイル名>` および API エンドポイントへの POST ボディに以下の形式の JSON を出力。
 
 ```json
 {
-  "datetime": "2026-04-18 21:00:00",
+  "fetched_at": "2026-04-18T21:00:00+09:00",
   "plan": "individual",
   "session_pct": 42,
-  "session_reset_at": "2026-04-18 23:00:00",
+  "session_reset_at": "2026-04-18T23:00:00+09:00",
   "weekly_pct": 71,
-  "weekly_reset_at": "2026-04-25 04:00:00"
+  "weekly_reset_at": "2026-04-25T04:00:00+09:00"
 }
 ```
 
-キーはアルファベット順でソート済み。全時刻は JST（Asia/Tokyo）固定。`datetime` は計測時刻、`*_pct` は使用率（整数%）、`*_reset_at` はリセット時刻（10 分単位に四捨五入）。
+キーはアルファベット順でソート済み。全時刻は JST（Asia/Tokyo）固定で、UTC オフセット付きの ISO 8601 形式（`+09:00`）。`fetched_at` は使用量の取得時刻、`*_pct` は使用率（整数%）、`*_reset_at` はリセット時刻（10 分単位に四捨五入）。
 
 ### `plan` フィールド
 
@@ -164,9 +181,26 @@ Orange へ遷移した瞬間に macOS のユーザー通知（`Claude Usage Warn
 | `"individual"` | 個人プラン（Pro / Max）。`session_*` は 5 時間ウィンドウ、`weekly_*` は 7 日ウィンドウに対応 |
 | `"enterprise"` | Enterprise プラン。`session_*` が月次使用率 + 月次リセット、`weekly_*` は常に `null` |
 
+## Notes
+
+### アプリインストールに関する補足
+
+- 既に Command Line Tools が入っている環境では、Xcode を導入しても `xcodebuild` が Command Line Tools を指したままになりビルドが失敗する。その場合は以下のコマンドで向き先を切り替え、Xcode の初回セットアップ（追加コンポーネントの導入とライセンス同意）を済ませてから `make install` を実行し直す（管理者権限が必要）。
+  ```
+  sudo xcode-select -s /Applications/Xcode.app
+  sudo xcodebuild -runFirstLaunch
+  ```
+- インストール後、`git clone` あるいは ZIP を展開したディレクトリ（プロジェクト）は削除してよい。
+- アンインストールは `make uninstall`。ログイン状態と設定もまとめて消すときは `make uninstall-all`（消す対象を表示して確認する）。
+
+### コード署名（Codesign）
+
+- 自力ビルド前提のため、App Store 配信や開発者署名は行っておらず、ビルドしたアプリはローカル専用の署名（ad-hoc）のまま。
+- ad-hoc 署名のため、ログイン時起動を有効にするときに macOS のシステム設定で承認を求められることがある。
+
 ## 詳細
 
-開発者向けの詳細情報（アーキテクチャ、設計判断、外部依存箇所、過去の不具合と対応など）は [DEVELOPMENT.md](docs/DEVELOPMENT.md) 参照。
+開発者向けの情報（設計上の決まりとその理由、ビルドと確認の方法など）は [DEVELOPMENT.md](DEVELOPMENT.md) 参照。
 
 ## License
 

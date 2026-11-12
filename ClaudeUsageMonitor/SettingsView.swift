@@ -12,6 +12,8 @@ struct SettingsView: View {
   @State private var intervalDraft: Int = 300
   @State private var apiEndpointDraft: String = ""
   @State private var monitoringFileNameDraft: String = ""
+  @State private var outputDirectoryModeDraft: OutputDirectoryMode = .tmp
+  @State private var customOutputDirectoryDraft: String = ""
   @State private var warningThresholdDraft: Int = 90
 
   // ログイン時起動は Save/Cancel の対象外。SMAppService がシステム側の真実の状態を
@@ -30,10 +32,31 @@ struct SettingsView: View {
       field(label: "APIエンドポイントURL", placeholder: "https://...", text: $apiEndpointDraft)
 
       VStack(alignment: .leading, spacing: 4) {
+        Text("モニタリング用JSON保存先").font(.caption).foregroundStyle(.secondary)
+        Picker("", selection: $outputDirectoryModeDraft) {
+          Text("$TMPDIR").tag(OutputDirectoryMode.tmp)
+          Text("任意のフォルダ").tag(OutputDirectoryMode.custom)
+        }
+        .pickerStyle(.radioGroup)
+        .labelsHidden()
+        HStack {
+          Button("選択…") { chooseOutputDirectory() }
+          Text(customOutputDirectoryDraft.isEmpty ? "未選択" : customOutputDirectoryDraft)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .help(customOutputDirectoryDraft)
+        }
+        .padding(.leading, 20)
+        .disabled(outputDirectoryModeDraft != .custom)
+      }
+      .controlSize(.small)
+
+      VStack(alignment: .leading, spacing: 4) {
         Text("モニタリング用JSONファイル名").font(.caption).foregroundStyle(.secondary)
         TextField("claude_usage.json", text: $monitoringFileNameDraft)
           .textFieldStyle(.roundedBorder)
-        Text("保存先: $TMPDIR").font(.caption2).foregroundStyle(.tertiary)
       }
 
       VStack(alignment: .leading, spacing: 4) {
@@ -59,6 +82,7 @@ struct SettingsView: View {
           dismiss()
         }
         .keyboardShortcut(.defaultAction)
+        .disabled(outputDirectoryModeDraft == .custom && customOutputDirectoryDraft.isEmpty)
       }
 
       Divider()
@@ -121,11 +145,26 @@ struct SettingsView: View {
     }
   }
 
+  private func chooseOutputDirectory() {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    panel.canCreateDirectories = true
+    panel.allowsMultipleSelection = false
+    if !customOutputDirectoryDraft.isEmpty {
+      panel.directoryURL = URL(fileURLWithPath: customOutputDirectoryDraft, isDirectory: true)
+    }
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    customOutputDirectoryDraft = url.path
+  }
+
   private func loadDrafts() {
     urlDraft = settings.url
     intervalDraft = settings.intervalSeconds
     apiEndpointDraft = settings.apiEndpointUrl
     monitoringFileNameDraft = settings.monitoringFileName
+    outputDirectoryModeDraft = settings.outputDirectoryMode
+    customOutputDirectoryDraft = settings.customOutputDirectory
     warningThresholdDraft = settings.warningThresholdPct
   }
 
@@ -134,12 +173,20 @@ struct SettingsView: View {
     if settings.intervalSeconds != intervalDraft { automation.appLog("設定変更: intervalSeconds \(settings.intervalSeconds) → \(intervalDraft)") }
     if settings.apiEndpointUrl != apiEndpointDraft { automation.appLog("設定変更: apiEndpointUrl \(settings.apiEndpointUrl) → \(apiEndpointDraft)") }
     if settings.monitoringFileName != monitoringFileNameDraft { automation.appLog("設定変更: monitoringFileName \(settings.monitoringFileName) → \(monitoringFileNameDraft)") }
+    if settings.outputDirectoryMode != outputDirectoryModeDraft { automation.appLog("設定変更: outputDirectoryMode \(settings.outputDirectoryMode.rawValue) → \(outputDirectoryModeDraft.rawValue)") }
+    if settings.customOutputDirectory != customOutputDirectoryDraft { automation.appLog("設定変更: customOutputDirectory \(settings.customOutputDirectory) → \(customOutputDirectoryDraft)") }
     if settings.warningThresholdPct != warningThresholdDraft { automation.appLog("設定変更: warningThresholdPct \(settings.warningThresholdPct) → \(warningThresholdDraft)") }
+    let outputChanged = settings.outputDirectoryMode != outputDirectoryModeDraft
+      || settings.customOutputDirectory != customOutputDirectoryDraft
+      || settings.monitoringFileName != monitoringFileNameDraft
     settings.url = urlDraft
     settings.intervalSeconds = intervalDraft
     settings.apiEndpointUrl = apiEndpointDraft
     settings.monitoringFileName = monitoringFileNameDraft
+    settings.outputDirectoryMode = outputDirectoryModeDraft
+    settings.customOutputDirectory = customOutputDirectoryDraft
     settings.warningThresholdPct = warningThresholdDraft
+    if outputChanged { automation.probeOutputDirectory() }
   }
 
   @ViewBuilder

@@ -73,7 +73,7 @@ class AutomationManager: NSObject, ObservableObject {
 
   private static let dateFormatter: DateFormatter = {
     let f = DateFormatter()
-    f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    f.dateFormat = "yyyy-MM-dd'T'HH:mm:ssxxx"
     f.locale = Locale(identifier: "en_US_POSIX")
     f.timeZone = AutomationManager.jst
     return f
@@ -554,7 +554,7 @@ class AutomationManager: NSObject, ObservableObject {
       let weeklyResetDate  = (sd?["resets_at"] as? String).flatMap { Self.parseISO8601($0) }?.roundedToNearestTenMinutes()
 
       let data = UsageData(
-        datetime: Self.dateFormatter.string(from: now),
+        fetchedAt: Self.dateFormatter.string(from: now),
         plan: plan.rawValue,
         sessionPct: sessionPct,
         sessionResetAt: sessionResetDate.map { Self.dateFormatter.string(from: $0) },
@@ -577,7 +577,7 @@ class AutomationManager: NSObject, ObservableObject {
       let sessionResetDate = Self.nextMonthFirstAtJST(from: now)
 
       let data = UsageData(
-        datetime: Self.dateFormatter.string(from: now),
+        fetchedAt: Self.dateFormatter.string(from: now),
         plan: plan.rawValue,
         sessionPct: sessionPct,
         sessionResetAt: sessionResetDate.map { Self.dateFormatter.string(from: $0) },
@@ -679,8 +679,11 @@ class AutomationManager: NSObject, ObservableObject {
       appLogDebug("ファイル書込 skip（未設定）")
       return .skipped
     }
-    let safeFileName = (settings.monitoringFileName as NSString).lastPathComponent
-    let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(safeFileName)
+    guard let directoryURL = settings.outputDirectoryURL else {
+      appLogWarn("ファイル書込失敗: 保存先フォルダ未選択")
+      return .failed(.fileWriteFailed)
+    }
+    let fileURL = directoryURL.appendingPathComponent(settings.safeMonitoringFileName)
     do {
       try data.write(to: fileURL, options: .atomic)
       appLogDebug("ファイル書込: \(fileURL.path)")
@@ -688,6 +691,23 @@ class AutomationManager: NSObject, ObservableObject {
     } catch {
       appLogWarn("ファイル書込失敗: \(error)")
       return .failed(.fileWriteFailed)
+    }
+  }
+
+  // 保存先変更の Save 時に書き込みを試し、TCC の確認をユーザーの在席中に出させる。
+  // 本来のファイル名に書くと既存の JSON を消してしまうため別名の隠しファイルを使う
+  func probeOutputDirectory() {
+    guard settings.outputDirectoryMode == .custom,
+          !settings.monitoringFileName.isEmpty,
+          let directoryURL = settings.outputDirectoryURL else { return }
+    let probeURL = directoryURL.appendingPathComponent(".\(settings.safeMonitoringFileName).probe")
+    do {
+      try Data("{}".utf8).write(to: probeURL)
+      try FileManager.default.removeItem(at: probeURL)
+      appLog("保存先の書込確認: \(directoryURL.path)")
+    } catch {
+      appLogWarn("保存先の書込確認失敗: \(error)")
+      applyStatus(.red(.outputFailed(.json)))
     }
   }
 
@@ -739,20 +759,24 @@ class AutomationManager: NSObject, ObservableObject {
     }.resume()
   }
 
-  // write と POST の結果を集約。どちらかが failed なら failure 扱い (ファイル失敗を優先)
-  // consecutiveFailureCount の二重加算を防ぐため 1 tick あたり 1 回だけ反映する
+  // write と POST の結果を集約。出力側の失敗はリロードで直らないため count に加算しない (ファイル失敗を優先)
   private func applyCombinedOutcome(file: FileOutcome, post: PostOutcome) {
-    // Fetch (JS 実行/パース) までは成功しているためここで summary を構築
     let summary = OutcomeSummary(fetch: "success", api: post.summaryLabel, json: file.summaryLabel)
     if case .failed(let reason) = file {
-      applyFailure(reason: reason, outcome: summary)
+      applyOutputFailure(.json, reason: reason, outcome: summary)
       return
     }
     if case .failed(let reason) = post {
-      applyFailure(reason: reason, outcome: summary)
+      applyOutputFailure(.api, reason: reason, outcome: summary)
       return
     }
     applySuccess(outcome: summary)
+  }
+
+  private func applyOutputFailure(_ target: OutputTarget, reason: FailureReason, outcome: OutcomeSummary) {
+    consecutiveFailureCount = 0
+    appLogWarn("出力失敗: \(reason)")
+    applyStatus(.red(.outputFailed(target)), outcome: outcome)
   }
 
   private func applySuccess(outcome: OutcomeSummary? = nil) {
@@ -778,7 +802,14 @@ class AutomationManager: NSObject, ObservableObject {
 
   // claude.ai 以外を表示中は自動リロード誘発ループを避けるため count 加算せず status のみ更新
   private func applyNotOnClaudePage() {
+    // 読込失敗の後に残るページで判定されるため、読込失敗の表示を上書きしない
+    if case .red(.pageLoadFailed) = status { return }
     applyStatus(.red(.notOnClaudePage))
+  }
+
+  func applyPageLoadFailed(_ error: Error) {
+    appLogWarn("ページ読込失敗: \(error.localizedDescription)")
+    applyStatus(.red(.pageLoadFailed))
   }
 
   // URL 未設定も同じく count に影響させない
@@ -829,11 +860,11 @@ class AutomationManager: NSObject, ObservableObject {
     }
   }
 
-  // メニューバーアイコンの 3 値色。status が失敗系なら red、
-  // 成功系かつ使用率が threshold 以上なら orange、それ以外は green。
-  // session/weekly が nil (Enterprise の weekly など) は 0% 扱いで判定する
   var statusBarColor: StatusBarColor {
-    if case .red = status { return .red }
+    if case .red(let reason) = status {
+      if case .notYetFetched = reason { return .green }
+      return .red
+    }
     guard let usage = lastUsage else { return .green }
     let threshold = settings.warningThresholdPct
     let sessionOver = (usage.sessionPct ?? 0) >= threshold
@@ -921,17 +952,27 @@ final class WebViewCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
   }
 
   func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+    guard !Self.isCancelledByNewerNavigation(error) else { return }
     if let url = automation?.pendingLoadURL {
       appLogWarn("手動更新: about:blank 暫定ナビゲーション失敗、pendingLoadURL クリア \(url)")
       automation?.pendingLoadURL = nil
     }
+    automation?.applyPageLoadFailed(error)
   }
 
   func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+    guard !Self.isCancelledByNewerNavigation(error) else { return }
     if let url = automation?.pendingLoadURL {
       appLogWarn("手動更新: ナビゲーション失敗、pendingLoadURL クリア \(url)")
       automation?.pendingLoadURL = nil
     }
+    automation?.applyPageLoadFailed(error)
+  }
+
+  // 新しい遷移に置き換わった中断は異常ではなく、その遷移が控えた pendingLoadURL も消してはならない
+  private static func isCancelledByNewerNavigation(_ error: Error) -> Bool {
+    let nsError = error as NSError
+    return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
   }
 
   func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
@@ -983,7 +1024,7 @@ enum UsagePlan: String, Codable {
 }
 
 struct UsageData: Codable {
-  let datetime: String
+  let fetchedAt: String
   let plan: String
   // Enterprise では weekly が常に nil。Individual でも片側 null のケース (resets_at null 含む) があり得る
   let sessionPct: Int?
@@ -994,12 +1035,12 @@ struct UsageData: Codable {
   // JSON 出力のフォーマット一貫性を守るため nil も必ず null として出力する
   // (synthesized Codable はデフォルトで nil キーを省略するので明示実装に置き換え)
   private enum CodingKeys: String, CodingKey {
-    case datetime, plan, sessionPct, sessionResetAt, weeklyPct, weeklyResetAt
+    case fetchedAt, plan, sessionPct, sessionResetAt, weeklyPct, weeklyResetAt
   }
 
   func encode(to encoder: Encoder) throws {
     var c = encoder.container(keyedBy: CodingKeys.self)
-    try c.encode(datetime, forKey: .datetime)
+    try c.encode(fetchedAt, forKey: .fetchedAt)
     try c.encode(plan, forKey: .plan)
     try c.encode(sessionPct, forKey: .sessionPct)
     try c.encode(sessionResetAt, forKey: .sessionResetAt)
@@ -1027,8 +1068,15 @@ enum RedReason {
   case notYetFetched
   case urlNotConfigured
   case notOnClaudePage
+  case pageLoadFailed
   case loginRequired
   case recentFailure(count: Int, lastReason: FailureReason)
+  case outputFailed(OutputTarget)
+}
+
+enum OutputTarget: String {
+  case json = "JSON"
+  case api = "API"
 }
 
 // 2 段 fetch のどちらで失敗したか。ログ・失敗分類で使う
@@ -1083,8 +1131,6 @@ private enum PostOutcome {
   }
 }
 
-// メニューバーアイコン色の 3 値表現。green = 取得成功かつ使用率が閾値未満、
-// orange = 取得成功だが session% または weekly% が閾値以上、red = 取得失敗系
 enum StatusBarColor {
   case green
   case orange
@@ -1116,10 +1162,14 @@ extension AutomationStatus {
       return "異常 - URL 未設定"
     case .red(.notOnClaudePage):
       return "異常 - ページを確認してください"
+    case .red(.pageLoadFailed):
+      return "異常 - ページ読込失敗"
     case .red(.loginRequired):
       return "異常 - 未ログイン (ウィンドウを表示してログイン)"
     case .red(.recentFailure(let count, _)):
       return "異常 - 取得失敗 (\(count)/3)"
+    case .red(.outputFailed(let target)):
+      return "異常 - 出力失敗 (\(target.rawValue))"
     }
   }
 }
