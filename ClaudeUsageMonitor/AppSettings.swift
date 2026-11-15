@@ -158,17 +158,19 @@ class AppSettings: ObservableObject {
     }
   }
 
-  var resolvedClaudeExecutable: URL? {
+  var claudeExecutable: ClaudeLocator.Resolution {
     ClaudeLocator.resolve(configured: claudePath, home: .homeDirectory) {
       FileManager.default.isExecutableFile(atPath: $0.path(percentEncoded: false))
     }
   }
 
-  var customConfigFolder: String? {
-    ClaudeConfigFolder.customFolderPath(claudeConfigDirectory, home: .homeDirectory)
+  var resolvedClaudeExecutable: URL? { claudeExecutable.url }
+
+  var configFolderInput: ClaudeConfigFolder.Input {
+    ClaudeConfigFolder.resolve(claudeConfigDirectory, home: .homeDirectory)
   }
 
-  var cacheFileURL: URL {
-    ClaudeConfigFolder.cacheFile(customFolder: customConfigFolder, home: .homeDirectory)
+  var cacheFileURL: URL? {
+    ClaudeConfigFolder.cacheFile(for: configFolderInput, home: .homeDirectory)
   }
 }

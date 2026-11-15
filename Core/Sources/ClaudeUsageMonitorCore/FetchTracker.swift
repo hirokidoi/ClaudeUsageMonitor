@@ -8,7 +8,7 @@ public enum FetchVerdict: Sendable, Equatable {
 /// 成否は `fetchedAtMs` が前回見た値から変わったかだけで決める。
 public struct FetchTracker: Sendable {
     private struct Baseline: Sendable {
-        var file: URL
+        var file: URL?
         var fetchedAtMs: Int64
     }
 
@@ -18,16 +18,16 @@ public struct FetchTracker: Sendable {
     public init() {}
 
     /// 比べる相手が無い (または別の場所の値) ときだけ true。
-    public func needsBaseline(for file: URL) -> Bool {
+    public func needsBaseline(for file: URL?) -> Bool {
         baseline?.file != file
     }
 
-    public mutating func seed(_ preRead: Int64?, file: URL) {
+    public mutating func seed(_ preRead: Int64?, file: URL?) {
         guard let preRead else { return }
         baseline = Baseline(file: file, fetchedAtMs: preRead)
     }
 
-    public mutating func record(_ outcome: FetchOutcome, file: URL) -> FetchVerdict {
+    public mutating func record(_ outcome: FetchOutcome, file: URL?) -> FetchVerdict {
         switch outcome {
         case let .failed(failure):
             consecutiveFailures += 1

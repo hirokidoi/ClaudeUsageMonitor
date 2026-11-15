@@ -193,7 +193,7 @@ class AutomationManager: ObservableObject {
     start()
 
     let file = settings.cacheFileURL
-    let request = FetchRequest(executable: settings.resolvedClaudeExecutable, customFolder: settings.customConfigFolder, cacheFile: file)
+    let request = FetchRequest(executable: settings.resolvedClaudeExecutable, customFolder: settings.configFolderInput, cacheFile: file)
     let readBaselineFirst = tracker.needsBaseline(for: file)
     let tolerance = settings.failureTolerance
     DispatchQueue.global().async { [weak self] in
@@ -204,7 +204,7 @@ class AutomationManager: ObservableObject {
     }
   }
 
-  private func finishFetch(_ result: FetchResult, file: URL, tolerance: Int) {
+  private func finishFetch(_ result: FetchResult, file: URL?, tolerance: Int) {
     tracker.seed(result.preRead, file: file)
     let verdict = tracker.record(result.outcome, file: file)
     if case .failure(let failure, let count) = verdict {
@@ -526,6 +526,7 @@ extension FetchFailure {
     switch self {
     case .claudeNotFound: return "claude が見つかりません (設定の Claude タブで場所を指定)"
     case .configFolderMissing: return "CLAUDE_CONFIG_DIR のフォルダがありません"
+    case .configFolderInvalid: return "CLAUDE_CONFIG_DIR のパスが無効です"
     case .launchFailed: return "claude を起動できません"
     case .timedOut: return "claude が時間内に終わりません"
     case .exitFailure(let code, _): return "claude が異常終了しました (終了コード \(code))"
@@ -547,7 +548,7 @@ extension FetchFailure {
   // ログ用。理由に詳細 (パス・stderr など) を添える
   var diagnostic: String {
     switch self {
-    case .configFolderMissing(let path), .cacheMissing(let path): return "\(reason): \(path)"
+    case .configFolderMissing(let path), .configFolderInvalid(let path), .cacheMissing(let path): return "\(reason): \(path)"
     case .launchFailed(let detail), .exitFailure(_, let detail): return detail.isEmpty ? reason : "\(reason): \(detail)"
     default: return reason
     }

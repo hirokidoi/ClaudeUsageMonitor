@@ -39,46 +39,53 @@ struct ClaudeTab: View {
 
   private var executable: URL? { settings.resolvedClaudeExecutable }
 
-  private var isConfigInputEmpty: Bool {
-    settings.claudeConfigDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  private var isConfigInvalid: Bool {
+    if case .invalid = settings.configFolderInput { return true }
+    return false
   }
 
   private var isConfigFolderMissing: Bool {
-    guard let folder = settings.customConfigFolder else { return false }
+    guard let folder = settings.configFolderInput.folderPath else { return false }
     return !ClaudeConfigFolder.folderExists(folder)
   }
 
   private var isCacheFileMissing: Bool {
-    guard !isConfigInputEmpty, !isConfigFolderMissing else { return false }
-    return !FileManager.default.fileExists(atPath: settings.cacheFileURL.path(percentEncoded: false))
+    guard settings.configFolderInput.folderPath != nil, !isConfigFolderMissing, let file = settings.cacheFileURL else { return false }
+    return !FileManager.default.fileExists(atPath: file.path(percentEncoded: false))
+  }
+
+  private var pathNote: (text: String, isWarning: Bool)? {
+    switch settings.claudeExecutable {
+    case let .found(url):
+      guard settings.claudePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+      return ("使うパス: \(Self.display(url.path(percentEncoded: false)))", false)
+    case .notFound: return ("よくあるインストール先に見つかりません", true)
+    case .invalid: return ("無効なパスです", true)
+    }
   }
 
   var body: some View {
     Form {
       SettingsRow("Claude Code CLI のパス：") {
         HStack(spacing: 7) {
-          CommittingTextField(draft: $pathDraft, value: settings.claudePath) { commitClaudePath($0) }
+          CommittingTextField(draft: $pathDraft, value: settings.claudePath, prompt: "空ならよくあるインストール先から探す") { commitClaudePath($0) }
           Button("選ぶ…") { chooseClaude() }
         }
       }
-      SettingsNote(
-        text: executable.map { "使うパス: \(Self.display($0.path(percentEncoded: false)))" } ?? "よくあるインストール先に見つかりません",
-        isWarning: executable == nil,
-        isSelectable: true
-      )
-      .reservingSpace(isShown: settings.claudePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-      Group {
-        versionBox
-        SettingsNote(text: "更新はターミナルで claude update を実行する。")
-      }
-      .reservingSpace(isShown: executable != nil)
+      SettingsNote(text: pathNote?.text ?? "", isWarning: pathNote?.isWarning ?? false, isSelectable: true)
+        .reservingSpace(isShown: pathNote != nil)
+      versionBox
+      SettingsNote(text: "更新はターミナルで claude update を実行する。")
+        .reservingSpace(isShown: executable != nil)
 
       SettingsRow("CLAUDE_CONFIG_DIR：") {
-        CommittingTextField(draft: $configDraft, value: settings.claudeConfigDirectory) { commitConfigDirectory($0) }
+        CommittingTextField(draft: $configDraft, value: settings.claudeConfigDirectory, prompt: "空なら渡さない") { commitConfigDirectory($0) }
       }
       .settingsRowSpacing()
       // 出し分けても行の高さを変えない。
       ZStack(alignment: .leading) {
+        SettingsNote(text: "無効なパスです", isWarning: true)
+          .reservingSpace(isShown: isConfigInvalid)
         SettingsNote(text: "このフォルダは存在しません", isWarning: true)
           .reservingSpace(isShown: isConfigFolderMissing)
         SettingsNote(text: "このフォルダに Claude Code の設定が見つかりません", isWarning: true)
@@ -98,7 +105,7 @@ struct ClaudeTab: View {
         }
       }
       .settingsRowSpacing()
-      SettingsNote(text: "Claude Code にログインできているかを確かめる。")
+      SettingsNote(text: "claude が正常に使える状態かを確かめる。")
         .settingsRowSpacing()
     }
     .settingsFormFrame()
@@ -194,8 +201,8 @@ struct ClaudeTab: View {
     testRun += 1
     let run = testRun
     test = .running
-    let executable = executable
-    let customFolder = settings.customConfigFolder
+    let executable = settings.claudeExecutable
+    let customFolder = settings.configFolderInput
     Task {
       let message = await Task.detached { ClaudeConnection.test(executable: executable, customFolder: customFolder) }.value
       if run == testRun { test = .finished(message) }

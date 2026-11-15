@@ -89,23 +89,42 @@ struct ClaudeCommandTests {
         }
     }
 
-    // MARK: customFolderPath / folderExists / cacheFile
+    @Test func executableParentFolderKeepsItsSpelling() {
+        // 標準化は連続した / をまとめる。
+        let kept = URL(filePath: "/opt//tools/claude")
+        let path = ClaudeInvocation.version(executable: kept, inheriting: parent).environment["PATH"] ?? ""
+        #expect(path.hasPrefix("/opt//tools:"))
+    }
+
+    // MARK: resolve / folderExists / cacheFile
+
+    private func resolved(_ input: String) -> ClaudeConfigFolder.Input {
+        ClaudeConfigFolder.resolve(input, home: home)
+    }
 
     @Test func emptyInputMeansNoCustomFolder() {
-        #expect(ClaudeConfigFolder.customFolderPath("", home: home) == nil)
-        #expect(ClaudeConfigFolder.customFolderPath("  \n", home: home) == nil)
+        #expect(resolved("") == .none)
+        #expect(resolved("  \n") == .none)
     }
 
     @Test func tildeIsExpandedAndTrailingSlashesAreDropped() {
-        #expect(ClaudeConfigFolder.customFolderPath("~/cfg/", home: home) == "/Users/tester/cfg")
-        #expect(ClaudeConfigFolder.customFolderPath("/a/b///", home: home) == "/a/b")
-        #expect(ClaudeConfigFolder.customFolderPath("  /a/b  ", home: home) == "/a/b")
-        #expect(ClaudeConfigFolder.customFolderPath("/", home: home) == "/")
+        #expect(resolved("~/cfg/") == .folder("/Users/tester/cfg"))
+        #expect(resolved("/a/b///") == .folder("/a/b"))
+        #expect(resolved("  /a/b  ") == .folder("/a/b"))
+        #expect(resolved("/") == .folder("/"))
     }
 
-    @Test func dotSegmentsAreKeptAsTyped() {
-        #expect(ClaudeConfigFolder.customFolderPath("/a/b/../c", home: home) == "/a/b/../c")
-        #expect(ClaudeConfigFolder.customFolderPath("/a/./b", home: home) == "/a/./b")
+    @Test func dotSegmentsAreInvalid() {
+        for input in ["/a/b/../c", "/a/./b", "~/../x", "/a/..", "/."] {
+            #expect(resolved(input) == .invalid(input))
+        }
+        #expect(resolved("/a/.hidden/..b/c.") == .folder("/a/.hidden/..b/c."))
+    }
+
+    @Test func relativeAndBareTildeAreInvalid() {
+        #expect(resolved("relative/dir") == .invalid("relative/dir"))
+        #expect(resolved(" ~ ") == .invalid("~"))
+        #expect(resolved("~user/x") == .invalid("~user/x"))
     }
 
     @Test func symlinksInTheTypedPathAreNotResolved() throws {
@@ -115,14 +134,8 @@ struct ClaudeCommandTests {
         try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
         let link = folder.path("link")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real.deletingLastPathComponent())
-        let typed = link.path(percentEncoded: false) + "/sub/.."
-        #expect(ClaudeConfigFolder.customFolderPath(typed, home: home) == typed)
-    }
-
-    @Test func relativePathIsReturnedAsIsAndDoesNotExist() throws {
-        let path = try #require(ClaudeConfigFolder.customFolderPath("relative/dir", home: home))
-        #expect(path == "relative/dir")
-        #expect(ClaudeConfigFolder.folderExists(path) == false)
+        let typed = link.path(percentEncoded: false) + "/sub/"
+        #expect(resolved(typed) == .folder(link.path(percentEncoded: false) + "/sub"))
     }
 
     @Test func folderExistsOnlyForExistingDirectories() throws {
@@ -134,25 +147,32 @@ struct ClaudeCommandTests {
         #expect(ClaudeConfigFolder.folderExists(folder.path("nope").path(percentEncoded: false)) == false)
     }
 
-    @Test func cacheFileFollowsTheCustomFolderOrHome() {
-        #expect(ClaudeConfigFolder.cacheFile(customFolder: "/data/cfg", home: home).path(percentEncoded: false) == "/data/cfg/.claude.json")
-        #expect(ClaudeConfigFolder.cacheFile(customFolder: nil, home: home).path(percentEncoded: false) == "/Users/tester/.claude.json")
+    @Test func cacheFileFollowsTheCustomFolderOrHomeAndInvalidHasNone() {
+        #expect(ClaudeConfigFolder.cacheFile(for: .folder("/data/cfg"), home: home)?.path(percentEncoded: false) == "/data/cfg/.claude.json")
+        #expect(ClaudeConfigFolder.cacheFile(for: .none, home: home)?.path(percentEncoded: false) == "/Users/tester/.claude.json")
+        #expect(ClaudeConfigFolder.cacheFile(for: .invalid("x"), home: home) == nil)
     }
 
     // MARK: ClaudeLocator
 
     @Test func configuredPathIsUsedWithoutCheckingExecutability() {
         let resolved = ClaudeLocator.resolve(configured: " ~/bin/claude ", home: home, isExecutable: { _ in false })
-        #expect(resolved?.path(percentEncoded: false) == "/Users/tester/bin/claude")
+        #expect(resolved.url?.path(percentEncoded: false) == "/Users/tester/bin/claude")
         let absolute = ClaudeLocator.resolve(configured: "/x/claude", home: home, isExecutable: { _ in false })
-        #expect(absolute?.path(percentEncoded: false) == "/x/claude")
+        #expect(absolute.url?.path(percentEncoded: false) == "/x/claude")
+    }
+
+    @Test func configuredPathThatIsRelativeOrHasDotSegmentsIsInvalid() {
+        for input in ["claude", "bin/claude", "./claude", "~", "~claude", "/x/../claude", "/x/./claude", "~/../claude"] {
+            #expect(ClaudeLocator.resolve(configured: input, home: home, isExecutable: { _ in true }) == .invalid)
+        }
     }
 
     @Test func emptyConfiguredPicksTheFirstExecutableCandidate() {
         let expanded = ClaudeLocator.candidates.map { ClaudeLocator.expand($0, home: home) }
-        #expect(ClaudeLocator.resolve(configured: "", home: home, isExecutable: { _ in true }) == expanded[0])
-        #expect(ClaudeLocator.resolve(configured: "", home: home, isExecutable: { $0 == expanded[2] || $0 == expanded[4] }) == expanded[2])
-        #expect(ClaudeLocator.resolve(configured: "  ", home: home, isExecutable: { _ in false }) == nil)
+        #expect(ClaudeLocator.resolve(configured: "", home: home, isExecutable: { _ in true }) == .found(expanded[0]))
+        #expect(ClaudeLocator.resolve(configured: "", home: home, isExecutable: { $0 == expanded[2] || $0 == expanded[4] }) == .found(expanded[2]))
+        #expect(ClaudeLocator.resolve(configured: "  ", home: home, isExecutable: { _ in false }) == .notFound)
     }
 
     @Test func homeRelativeCandidatesStartUnderHome() {

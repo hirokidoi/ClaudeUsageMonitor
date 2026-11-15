@@ -37,7 +37,7 @@ struct UsageFetcherTests {
         \(writeCache(newCache(1_790_000_000_555)))
         """)
         let custom = config.path(percentEncoded: false)
-        let request = FetchRequest(executable: scriptURL, customFolder: custom, cacheFile: config.appending(path: ".claude.json"))
+        let request = FetchRequest(executable: scriptURL, customFolder: .folder(custom), cacheFile: config.appending(path: ".claude.json"))
 
         let result = UsageFetcher.run(request, readBaselineFirst: false, inheriting: parentEnvironment(home: folder.url))
 
@@ -60,8 +60,8 @@ struct UsageFetcherTests {
         defer { folder.remove() }
         let scriptURL = try folder.script("cat > \"$HOME/.claude.json\" <<'JSON'\n\(newCache(1_790_000_000_001))\nJSON")
         let request = FetchRequest(
-            executable: scriptURL, customFolder: nil,
-            cacheFile: ClaudeConfigFolder.cacheFile(customFolder: nil, home: folder.url)
+            executable: scriptURL, customFolder: .none,
+            cacheFile: ClaudeConfigFolder.cacheFile(for: .none, home: folder.url)
         )
         let result = UsageFetcher.run(request, readBaselineFirst: false, inheriting: parentEnvironment(home: folder.url))
         guard case let .read(cache) = result.outcome else { Issue.record("expected read, got \(result.outcome)"); return }
@@ -73,7 +73,7 @@ struct UsageFetcherTests {
         defer { folder.remove() }
         try folder.write(newCache(111), as: ".claude.json")
         let scriptURL = try folder.script("cat > \"$HOME/.claude.json\" <<'JSON'\n\(newCache(222))\nJSON")
-        let request = FetchRequest(executable: scriptURL, customFolder: nil, cacheFile: folder.path(".claude.json"))
+        let request = FetchRequest(executable: scriptURL, customFolder: .none, cacheFile: folder.path(".claude.json"))
         let environment = parentEnvironment(home: folder.url)
 
         let withBaseline = UsageFetcher.run(request, readBaselineFirst: true, inheriting: environment)
@@ -90,7 +90,7 @@ struct UsageFetcherTests {
         defer { folder.remove() }
         try folder.write(newCache(111), as: ".claude.json")
         let scriptURL = try folder.script("echo boom >&2\nexit 3")
-        let request = FetchRequest(executable: scriptURL, customFolder: nil, cacheFile: folder.path(".claude.json"))
+        let request = FetchRequest(executable: scriptURL, customFolder: .none, cacheFile: folder.path(".claude.json"))
         let result = UsageFetcher.run(request, readBaselineFirst: false, inheriting: parentEnvironment(home: folder.url))
         #expect(result.outcome == .failed(.exitFailure(code: 3, detail: "boom")))
     }
@@ -99,7 +99,7 @@ struct UsageFetcherTests {
         let folder = try TempFolder()
         defer { folder.remove() }
         let scriptURL = try folder.script("printf '%0500d' 0\nexit 1")
-        let request = FetchRequest(executable: scriptURL, customFolder: nil, cacheFile: folder.path(".claude.json"))
+        let request = FetchRequest(executable: scriptURL, customFolder: .none, cacheFile: folder.path(".claude.json"))
         let result = UsageFetcher.run(request, readBaselineFirst: false, inheriting: parentEnvironment(home: folder.url))
         guard case let .failed(.exitFailure(code, detail)) = result.outcome else { Issue.record("expected exitFailure"); return }
         #expect(code == 1)
@@ -110,7 +110,7 @@ struct UsageFetcherTests {
         let folder = try TempFolder()
         defer { folder.remove() }
         let scriptURL = try folder.script("exec sleep 60")
-        let request = FetchRequest(executable: scriptURL, customFolder: nil, cacheFile: folder.path(".claude.json"))
+        let request = FetchRequest(executable: scriptURL, customFolder: .none, cacheFile: folder.path(".claude.json"))
         let started = Date()
         let result = UsageFetcher.run(
             request, readBaselineFirst: false, inheriting: parentEnvironment(home: folder.url), timeout: shortTimeout
@@ -123,7 +123,7 @@ struct UsageFetcherTests {
         let folder = try TempFolder()
         defer { folder.remove() }
         try folder.write("#!/bin/sh\n", as: "claude")
-        let request = FetchRequest(executable: folder.path("claude"), customFolder: nil, cacheFile: folder.path(".claude.json"))
+        let request = FetchRequest(executable: folder.path("claude"), customFolder: .none, cacheFile: folder.path(".claude.json"))
         let result = UsageFetcher.run(request, readBaselineFirst: false, inheriting: parentEnvironment(home: folder.url))
         guard case .failed(.launchFailed) = result.outcome else { Issue.record("expected launchFailed, got \(result.outcome)"); return }
     }
@@ -131,7 +131,7 @@ struct UsageFetcherTests {
     @Test func missingExecutableIsClaudeNotFound() throws {
         let folder = try TempFolder()
         defer { folder.remove() }
-        let request = FetchRequest(executable: nil, customFolder: nil, cacheFile: folder.path(".claude.json"))
+        let request = FetchRequest(executable: nil, customFolder: .none, cacheFile: folder.path(".claude.json"))
         #expect(UsageFetcher.run(request, readBaselineFirst: false).outcome == .failed(.claudeNotFound))
     }
 
@@ -141,9 +141,24 @@ struct UsageFetcherTests {
         let marker = folder.path("started").path(percentEncoded: false)
         let scriptURL = try folder.script("touch \"\(marker)\"")
         let missing = folder.path("nope").path(percentEncoded: false)
-        let request = FetchRequest(executable: scriptURL, customFolder: missing, cacheFile: folder.path("nope/.claude.json"))
+        let request = FetchRequest(executable: scriptURL, customFolder: .folder(missing), cacheFile: folder.path("nope/.claude.json"))
         let result = UsageFetcher.run(request, readBaselineFirst: false, inheriting: parentEnvironment(home: folder.url))
         #expect(result.outcome == .failed(.configFolderMissing(missing)))
+        #expect(FileManager.default.fileExists(atPath: marker) == false)
+    }
+
+    @Test func invalidCustomFolderFailsWithoutStartingTheCommand() throws {
+        let folder = try TempFolder()
+        defer { folder.remove() }
+        let marker = folder.path("started").path(percentEncoded: false)
+        let scriptURL = try folder.script("touch \"\(marker)\"")
+        try FileManager.default.createDirectory(at: folder.path("sub"), withIntermediateDirectories: true)
+        // `..` を含んでも OS は存在すると答えるフォルダ。
+        let typed = folder.url.path(percentEncoded: false) + "/sub/.."
+        let request = FetchRequest(executable: scriptURL, customFolder: .invalid(typed), cacheFile: nil)
+        let result = UsageFetcher.run(request, readBaselineFirst: true, inheriting: parentEnvironment(home: folder.url))
+        #expect(result.outcome == .failed(.configFolderInvalid(typed)))
+        #expect(result.preRead == nil)
         #expect(FileManager.default.fileExists(atPath: marker) == false)
     }
 
@@ -152,7 +167,7 @@ struct UsageFetcherTests {
         defer { folder.remove() }
         let scriptURL = try folder.script("exit 0")
         let cacheFile = folder.path(".claude.json")
-        let request = FetchRequest(executable: scriptURL, customFolder: nil, cacheFile: cacheFile)
+        let request = FetchRequest(executable: scriptURL, customFolder: .none, cacheFile: cacheFile)
         let result = UsageFetcher.run(request, readBaselineFirst: false, inheriting: parentEnvironment(home: folder.url))
         #expect(result.outcome == .failed(.cacheMissing(cacheFile.path(percentEncoded: false))))
     }
@@ -161,7 +176,7 @@ struct UsageFetcherTests {
         let folder = try TempFolder()
         defer { folder.remove() }
         let scriptURL = try folder.script("printf '{' > \"$HOME/.claude.json\"")
-        let request = FetchRequest(executable: scriptURL, customFolder: nil, cacheFile: folder.path(".claude.json"))
+        let request = FetchRequest(executable: scriptURL, customFolder: .none, cacheFile: folder.path(".claude.json"))
         let result = UsageFetcher.run(request, readBaselineFirst: false, inheriting: parentEnvironment(home: folder.url))
         #expect(result.outcome == .failed(.cacheUnreadable))
     }
@@ -170,7 +185,7 @@ struct UsageFetcherTests {
         let folder = try TempFolder()
         defer { folder.remove() }
         let scriptURL = try folder.script("cat > \"$HOME/.claude.json\" <<'JSON'\n\(cacheJSON(includeAccount: false))\nJSON")
-        let request = FetchRequest(executable: scriptURL, customFolder: nil, cacheFile: folder.path(".claude.json"))
+        let request = FetchRequest(executable: scriptURL, customFolder: .none, cacheFile: folder.path(".claude.json"))
         let result = UsageFetcher.run(request, readBaselineFirst: false, inheriting: parentEnvironment(home: folder.url))
         #expect(result.outcome == .failed(.notLoggedIn))
     }

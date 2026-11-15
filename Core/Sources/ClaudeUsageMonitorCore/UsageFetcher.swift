@@ -3,6 +3,7 @@ import Foundation
 public enum FetchFailure: Error, Equatable, Sendable {
     case claudeNotFound
     case configFolderMissing(String)
+    case configFolderInvalid(String)
     case launchFailed(String)
     case timedOut
     case exitFailure(code: Int32, detail: String)
@@ -15,10 +16,11 @@ public enum FetchFailure: Error, Equatable, Sendable {
 
 public struct FetchRequest: Sendable, Equatable {
     public var executable: URL?
-    public var customFolder: String?
-    public var cacheFile: URL
+    public var customFolder: ClaudeConfigFolder.Input
+    /// 設定フォルダの入力が無効なら nil。
+    public var cacheFile: URL?
 
-    public init(executable: URL?, customFolder: String?, cacheFile: URL) {
+    public init(executable: URL?, customFolder: ClaudeConfigFolder.Input, cacheFile: URL?) {
         self.executable = executable
         self.customFolder = customFolder
         self.cacheFile = cacheFile
@@ -47,17 +49,19 @@ public enum UsageFetcher {
         timeout: TimeInterval = ClaudeRunner.timeout
     ) -> FetchResult {
         var preRead: Int64?
-        if readBaselineFirst, case let .ok(cache) = UsageCacheReader.read(at: request.cacheFile) {
+        if readBaselineFirst, let file = request.cacheFile, case let .ok(cache) = UsageCacheReader.read(at: file) {
             preRead = cache.fetchedAtMs
         }
         func failed(_ failure: FetchFailure) -> FetchResult { FetchResult(preRead: preRead, outcome: .failed(failure)) }
 
         guard let executable = request.executable else { return failed(.claudeNotFound) }
+        // 無効のまま進むと CLAUDE_CONFIG_DIR を渡さずに起動してしまう。
+        if case let .invalid(input) = request.customFolder { return failed(.configFolderInvalid(input)) }
         // claude は無いフォルダを作ってしまう (実測)。
-        if let folder = request.customFolder, !ClaudeConfigFolder.folderExists(folder) {
+        if let folder = request.customFolder.folderPath, !ClaudeConfigFolder.folderExists(folder) {
             return failed(.configFolderMissing(folder))
         }
-        let invocation = ClaudeInvocation.usage(executable: executable, customFolder: request.customFolder, inheriting: inheriting)
+        let invocation = ClaudeInvocation.usage(executable: executable, customFolder: request.customFolder.folderPath, inheriting: inheriting)
         switch ClaudeRunner.run(invocation, timeout: timeout) {
         case let .failure(.launch(detail)): return failed(.launchFailed(detail))
         case .failure(.timedOut): return failed(.timedOut)
@@ -66,9 +70,10 @@ public enum UsageFetcher {
                 return failed(.exitFailure(code: reply.exitCode, detail: reply.detail(limit: detailLimit)))
             }
         }
-        switch UsageCacheReader.read(at: request.cacheFile) {
+        guard let cacheFile = request.cacheFile else { return failed(.cacheUnreadable) }
+        switch UsageCacheReader.read(at: cacheFile) {
         case let .ok(cache): return FetchResult(preRead: preRead, outcome: .read(cache))
-        case .missing: return failed(.cacheMissing(request.cacheFile.path(percentEncoded: false)))
+        case .missing: return failed(.cacheMissing(cacheFile.path(percentEncoded: false)))
         case .unreadable: return failed(.cacheUnreadable)
         case .notLoggedIn: return failed(.notLoggedIn)
         }

@@ -118,7 +118,7 @@ struct NumberField: View {
 /// `commit` は確定した値の表示を返し、下書きがそれに揃う。
 struct CommittingTextField: View {
   @Binding var draft: String
-  /// 設定側の今の値。外から変わったら下書きを合わせる。
+  /// 設定側の今の値。
   let value: String
   var prompt = ""
   let commit: (String) -> String
@@ -143,7 +143,6 @@ struct CommittingTextField: View {
         if !focused { commitDraft() }
       }
       .onChange(of: value) { _, new in
-        // 手を付けていない下書きは、フォーカス中でも外からの変更に追従する。
         if !isFocused || draft == committed { draft = new }
         committed = new
       }
