@@ -1,4 +1,4 @@
-.PHONY: build install uninstall uninstall-all clean
+.PHONY: build test install uninstall uninstall-all clean
 
 APP_NAME := ClaudeUsageMonitor
 PROJECT := $(APP_NAME).xcodeproj
@@ -8,6 +8,9 @@ DEST := /Applications/$(APP_NAME).app
 
 build:
 	xcodebuild -project $(PROJECT) -scheme $(APP_NAME) -configuration Release -derivedDataPath build build
+
+test:
+	swift test --package-path Core
 
 install: build
 	rm -rf "$(DEST)"
@@ -49,4 +52,4 @@ uninstall-all:
 	echo "削除しました。"
 
 clean:
-	rm -rf build
+	rm -rf build Core/.build

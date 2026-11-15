@@ -1,38 +1,38 @@
 import SwiftUI
 import AppKit
+import ClaudeUsageMonitorCore
 
 @main
 struct ClaudeUsageMonitorApp: App {
   @StateObject private var settings: AppSettings
   @StateObject private var automation: AutomationManager
   @StateObject private var logStore: LogStore
+  @StateObject private var windows: AppWindows
 
   init() {
     let settings = AppSettings()
     let logStore = LogStore()
+    let automation = AutomationManager(settings: settings, logStore: logStore)
     _settings = StateObject(wrappedValue: settings)
     _logStore = StateObject(wrappedValue: logStore)
-    _automation = StateObject(wrappedValue: AutomationManager(settings: settings, logStore: logStore))
+    _automation = StateObject(wrappedValue: automation)
+    _windows = StateObject(wrappedValue: AppWindows(settings: settings, automation: automation))
   }
 
   var body: some Scene {
     MenuBarExtra {
       MenuContentView()
+        .environmentObject(settings)
         .environmentObject(automation)
         .environmentObject(logStore)
+        .environmentObject(windows)
     } label: {
       // MenuBarExtra の label は SF Symbol を template 化して色を落とすため、
       // NSImage を自前描画し isTemplate=false で色を確実に反映させる
       Image(nsImage: Self.statusBarIcon(color: automation.statusBarColor))
     }
 
-    Settings {
-      SettingsView()
-        .environmentObject(settings)
-        .environmentObject(automation)
-    }
-
-    Window("ログ", id: "log") {
+    Window(LogWindow.title, id: LogWindow.id) {
       LogView()
         .environmentObject(logStore)
     }
@@ -93,47 +93,53 @@ struct ClaudeUsageMonitorApp: App {
   }
 }
 
+enum LogWindow {
+  static let id = "log"
+  static let title = "ログ"
+
+  // activate() は他のアプリが使用中だと断られうるので、ウィンドウは必ず前に出す
+  static func orderFront() {
+    NSApp.windows.first { $0.title == title }?.orderFrontRegardless()
+  }
+}
+
 struct MenuContentView: View {
+  @EnvironmentObject var settings: AppSettings
   @EnvironmentObject var automation: AutomationManager
+  @EnvironmentObject var windows: AppWindows
   @Environment(\.openWindow) private var openWindow
-
-  // session reset: 5 時間以内なので時分のみ (1 桁時はゼロ埋めしない: 4:00)。
-  // 端末 TZ に依存せず常に JST で表示する
-  private static let sessionResetFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateFormat = "H:mm"
-    f.locale = Locale(identifier: "ja_JP")
-    f.timeZone = TimeZone(identifier: "Asia/Tokyo")
-    return f
-  }()
-
-  // weekly / Enterprise monthly reset: 「4/24 (金) 4:00」形式 (1 桁時はゼロ埋めしない)
-  private static let weeklyResetFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateFormat = "M/d (E) H:mm"
-    f.locale = Locale(identifier: "ja_JP")
-    f.timeZone = TimeZone(identifier: "Asia/Tokyo")
-    return f
-  }()
 
   var body: some View {
     // プランに応じてサマリ行数・ラベルが変わる。クリック不可のラベル表示 (`.disabled` で macOS 標準のグレー化)
     summaryRows
+    if let fetchedAt = automation.lastUsage?.fetchedAt {
+      Text("最終取得 \(JST.dateTime(fetchedAt))").disabled(true)
+    }
     Divider()
-    Text(automation.status.text).disabled(true)
+    ForEach(Array(automation.status.lines(lastFetchedAt: automation.lastUsage?.fetchedAt).enumerated()), id: \.offset) { _, line in
+      Text(line).disabled(true)
+    }
     Divider()
-    Button("ウィンドウを表示") {
-      automation.showMainWindow()
+    // 更新間隔 0 は自動更新しない設定なので、切り替えを出さない
+    if settings.intervalMinutes > 0 {
+      Toggle("自動更新", isOn: $settings.autoRefreshEnabled)
+      Divider()
     }
     Button("手動更新") {
       automation.runManualFetch()
     }
-    SettingsLink {
-      Text("設定…")
+    Button("設定…") {
+      windows.showSettings()
     }
-    Button("ログ") {
-      openWindow(id: "log")
-      NSApp.activate(ignoringOtherApps: true)
+    .keyboardShortcut(",", modifiers: .command)
+    Button(LogWindow.title) {
+      openWindow(id: LogWindow.id)
+      NSApp.activate()
+      // 開いた直後はウィンドウがまだ無いことがあるので、次の順番で探す
+      DispatchQueue.main.async { LogWindow.orderFront() }
+    }
+    Button("\(Bundle.main.appName) について") {
+      windows.showAbout()
     }
     Divider()
     Button("終了") {
@@ -146,16 +152,20 @@ struct MenuContentView: View {
   private var summaryRows: some View {
     let usage = automation.lastUsage
     let plan: UsagePlan = usage?.plan ?? .individual
+    // 現在時刻は描画のときに読む。リセット済みの枠の % はもう今の使用率ではない
+    let now = Date()
+    let sessionHasReset = usage?.sessionHasReset(asOf: now) ?? false
+    let weeklyHasReset = usage?.weeklyHasReset(asOf: now) ?? false
     switch plan {
     case .individual:
-      Text("Session limits (5h): \(percentText(usage?.sessionPct))").disabled(true)
-      Text("  - Resets \(usage.flatMap { Self.formatSessionReset($0.sessionResetAt) } ?? "----")").disabled(true)
-      Text("Weekly limits: \(percentText(usage?.weeklyPct))").disabled(true)
-      Text("  - Resets \(usage.flatMap { Self.formatWeeklyReset($0.weeklyResetAt) } ?? "----")").disabled(true)
+      Text("Session limits (5h): \(percentText(sessionHasReset ? nil : usage?.sessionPct))").disabled(true)
+      Text("  - Resets \(resetText(usage?.sessionResetAt, format: JST.time, hasReset: sessionHasReset))").disabled(true)
+      Text("Weekly limits: \(percentText(weeklyHasReset ? nil : usage?.weeklyPct))").disabled(true)
+      Text("  - Resets \(resetText(usage?.weeklyResetAt, format: JST.dateTime, hasReset: weeklyHasReset))").disabled(true)
     case .enterprise:
-      Text("Monthly limits: \(percentText(usage?.sessionPct))").disabled(true)
-      // Enterprise の月次リセットは日付込みで表示する必要があるため weeklyResetFormatter を流用
-      Text("  - Resets \(usage.flatMap { Self.formatWeeklyReset($0.sessionResetAt) } ?? "----")").disabled(true)
+      Text("Monthly limits: \(percentText(sessionHasReset ? nil : usage?.sessionPct))").disabled(true)
+      // 月次リセットは日付込みで表示する
+      Text("  - Resets \(resetText(usage?.sessionResetAt, format: JST.dateTime, hasReset: sessionHasReset))").disabled(true)
     }
   }
 
@@ -163,12 +173,10 @@ struct MenuContentView: View {
     pct.map { "\($0)%" } ?? "----"
   }
 
-  private static func formatSessionReset(_ date: Date?) -> String? {
-    date.map { sessionResetFormatter.string(from: $0) }
-  }
-
-  private static func formatWeeklyReset(_ date: Date?) -> String? {
-    date.map { weeklyResetFormatter.string(from: $0) }
+  // 表示する時刻は丸めた値のまま。過去かどうかは呼び出し側が判定した hasReset に従う
+  private func resetText(_ date: Date?, format: (Date) -> String, hasReset: Bool) -> String {
+    guard let date else { return "----" }
+    return hasReset ? "\(format(date)) (経過)" : format(date)
   }
 }
 
