@@ -28,6 +28,8 @@ class AutomationManager: ObservableObject {
 
   // 起動直後はネットワークが未確立のことがあるので、最初の取得を遅らせる (設計値)
   private static let startupFetchDelaySeconds: TimeInterval = 5
+  // 自動の取得の開始に足す揺らぎの上限 (設計値)
+  private static let maxFetchJitterSeconds: TimeInterval = 20
   private static let secondsPerMinute: TimeInterval = 60
   // POST の -1009 を取り直すまでの待ち (設計値)
   private static let postRetryDelaySeconds: TimeInterval = 2
@@ -82,8 +84,9 @@ class AutomationManager: ObservableObject {
 
     // 自動更新しないときは手動更新だけなので、起動直後の取得も予約しない
     if settings.isAutoRefreshActive {
-      appLogDebug("起動 \(Int(Self.startupFetchDelaySeconds)) 秒後に起動直後の取得を予約")
-      DispatchQueue.main.asyncAfter(deadline: .now() + Self.startupFetchDelaySeconds) { [weak self] in
+      let delay = Self.startupFetchDelaySeconds + Self.fetchJitter()
+      appLogDebug("起動 \(Int(delay)) 秒後に起動直後の取得を予約")
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
         self?.runStartupFetch()
       }
     }
@@ -126,7 +129,10 @@ class AutomationManager: ObservableObject {
     TimeInterval(settings.intervalMinutes) * Self.secondsPerMinute
   }
 
-  // firstFireIn を渡すと、最初の発火だけその秒数後にする
+  private static func fetchJitter() -> TimeInterval {
+    .random(in: 0...maxFetchJitterSeconds)
+  }
+
   func start(firstFireIn: TimeInterval? = nil) {
     timer?.invalidate()
     timer = nil
@@ -135,7 +141,7 @@ class AutomationManager: ObservableObject {
       return
     }
     let interval = intervalSeconds
-    let firstFire = firstFireIn ?? interval
+    let firstFire = (firstFireIn ?? interval) + Self.fetchJitter()
     appLogDebug("Timer 再貼付: interval=\(interval)s first=\(Int(firstFire))s")
     let newTimer = Timer(fire: Date().addingTimeInterval(firstFire), interval: interval, repeats: true) { [weak self] _ in
       DispatchQueue.main.async { [weak self] in
@@ -147,8 +153,7 @@ class AutomationManager: ObservableObject {
     timer = newTimer
   }
 
-  // 続けて切り替えても取りに行きすぎないよう、前回の取得から間隔がたっていなければ残りを待つ。
-  // 取得中で tick が飛ばされてもタイマーは張る
+  // 続けて切り替えても取りに行きすぎないよう、前回の取得から間隔がたっていなければ残りを待つ
   private func autoRefreshChanged() {
     guard settings.isAutoRefreshActive else {
       start()
@@ -156,8 +161,7 @@ class AutomationManager: ObservableObject {
     }
     switch AutoRefreshResume.decide(lastAttempt: lastTickAt, now: Date(), interval: intervalSeconds) {
     case .fetchNow:
-      start()
-      tick()
+      start(firstFireIn: 0)
     case .waitThenFetch(let remaining):
       start(firstFireIn: remaining)
     }
@@ -205,6 +209,9 @@ class AutomationManager: ObservableObject {
   }
 
   private func finishFetch(_ result: FetchResult, file: URL?, tolerance: Int) {
+    for (index, failure) in result.retriedFailures.enumerated() {
+      appLog("claude 失敗 (\(index + 1)/\(UsageFetcher.commandAttempts) 回目、再試行): \(failure.diagnostic)")
+    }
     tracker.seed(result.preRead, file: file)
     let verdict = tracker.record(result.outcome, file: file)
     if case .failure(let failure, let count) = verdict {
@@ -217,7 +224,7 @@ class AutomationManager: ObservableObject {
       return
     }
     let (usage, snapshot) = UsagePayload.make(from: cache)
-    if case .success = verdict { logFetchSuccess(usage) }
+    if case .success = verdict { logFetchSuccess(usage, call: result.retriedFailures.count + 1) }
     lastUsage = snapshot
     guard let outputData = try? usage.jsonData() else {
       appLogWarn("UsageData エンコード失敗")
@@ -240,12 +247,13 @@ class AutomationManager: ObservableObject {
   }
 
   // fetch 成功時のサマリを INFO ログに出す
-  private func logFetchSuccess(_ usage: UsageData) {
+  private func logFetchSuccess(_ usage: UsageData, call: Int) {
     let sessionLabel = usage.sessionPct.map { "\($0)%" } ?? "----"
     let sReset = usage.sessionResetAt ?? "-"
     let weeklyLabel = usage.weeklyPct.map { "\($0)%" } ?? "----"
     let wReset = usage.weeklyResetAt ?? "-"
-    appLog("fetch 成功: plan=\(usage.plan) session=\(sessionLabel) reset=\(sReset), weekly=\(weeklyLabel) reset=\(wReset)")
+    let callLabel = call > 1 ? " (\(call) 回目の呼び出しで取得)" : ""
+    appLog("fetch 成功\(callLabel): plan=\(usage.plan) session=\(sessionLabel) reset=\(sReset), weekly=\(weeklyLabel) reset=\(wReset)")
   }
 
   // MARK: - Output
